@@ -112,6 +112,7 @@ td.r,th.r{text-align:right}
 
   <!-- 订阅视图 -->
   <div id="subView" style="display:none">
+    <div class="back" onclick="go('list')">‹ 返回主页</div>
     <div class="sub-input">
       <input id="kwInput" placeholder="输入楼盘关键词，如：凤起潮鸣苑">
       <button onclick="addSub()">订阅</button>
@@ -134,6 +135,11 @@ td.r,th.r{text-align:right}
 <div class="toast" id="toast"></div>
 
 <script>
+// 全局错误收集：E2E 测试断言 __errs 为空，线上也能快速定位白屏原因
+window.__errs = [];
+window.addEventListener('error', e => window.__errs.push(String(e.message||e)));
+window.addEventListener('unhandledrejection', e => window.__errs.push('unhandled: '+String(e.reason)));
+
 const $=s=>document.querySelector(s);
 let PRO=[], SUBS=[], CHANGES=[], sortKey='alive', view='list', MODE='api', CACHE=null;
 
@@ -228,6 +234,7 @@ async function openDetail(name){
   if(d.error){toast(d.error);return}
   view='detail';
   $('#listView').style.display='none';
+  $('#subView').style.display='none';
   const dv=$('#detailView'); dv.style.display='block';
   const clearTxt = d.days_to_clear ? '约 '+d.days_to_clear+' 天' : '—';
   dv.innerHTML=`
@@ -279,7 +286,7 @@ async function openDetail(name){
   window.scrollTo(0,0);
 }
 
-function backList(){view='list';$('#listView').style.display='';$('#detailView').style.display='none'}
+function backList(){view='list';go('list')}
 
 function sparkline(snaps){
   if(!snaps||snaps.length<2) return '<div class="empty" style="padding:18px 0">数据点不足（至少 2 次抓取），明日此时可见趋势~</div>';
@@ -309,7 +316,13 @@ const LSK = 'sz_subs_v1';
 function localSubs(){ try{ return JSON.parse(localStorage.getItem(LSK)||'[]'); }catch(e){ return []; } }
 function saveLocalSubs(a){ try{ localStorage.setItem(LSK, JSON.stringify(a)); }catch(e){} }
 function mergeSubs(remote){
+  /* 订阅是「本机收藏」，localStorage 是唯一真相源。
+     坑：早期实现把 data.json 里的 subscriptions 合并回 localStorage，结果
+     用户删掉的订阅在下次加载时"复活"（服务器快照又注入了），删除功能形同虚设。
+     现在只在『本地跑 serve.py』（api 模式，有真实服务端）时才合并，
+     静态托管下 data.json 的 subscriptions 仅用于后台推送，不影响前端。 */
   const L = localSubs();
+  if(MODE !== 'api') return L;
   const seen = new Set(L.map(s=>s.keyword));
   for(const r of (remote||[])) if(r.keyword && !seen.has(r.keyword)){
     L.push({id:'r'+r.id, keyword:r.keyword, note:r.note||'', remote:true}); seen.add(r.keyword);
@@ -330,7 +343,13 @@ async function loadChanges(){
 function renderSubs(){
   const el=$('#subs');
   if(!SUBS.length){el.innerHTML='<div class="empty" style="padding:14px 0;width:100%">还没有订阅，输入楼盘名添加~</div>';return}
-  el.innerHTML=SUBS.map(s=>`<span class="chip">${esc(s.keyword)}<button onclick="delSub(${s.id})">×</button></span>`).join('');
+  // 注意：id 是字符串（'L1759...'），必须用引号包起来。
+  // 直接写 onclick="delSub(${s.id})" 会生成 delSub(L1759...) -> JS 当变量名 -> ReferenceError，
+  // 表现就是"删除按钮点了没反应"。用 data 属性 + 事件委托最稳。
+  el.innerHTML=SUBS.map(s=>`<span class="chip">${esc(s.keyword)}<button data-del="${esc(String(s.id))}" title="取消订阅">×</button></span>`).join('');
+  el.querySelectorAll('button[data-del]').forEach(b=>{
+    b.onclick=(ev)=>{ ev.stopPropagation(); delSub(b.dataset.del); };
+  });
 }
 async function addSub(){
   const kw=$('#kwInput').value.trim();
@@ -363,13 +382,24 @@ $('#tabs').addEventListener('click',e=>{
   t.classList.add('on'); sortKey=t.dataset.sort; renderList();
 });
 
-// 底部 Tab（通过 header 副标题切换订阅视图）
-document.querySelector('.h-sub').innerHTML+='<span style="color:var(--acc);cursor:pointer" onclick="toggleSub()">📌 订阅</span>';
-function toggleSub(){
-  const sv=$('#subView'), lv=$('#listView');
-  if(sv.style.display==='none'){sv.style.display='';lv.style.display='none';$('#detailView').style.display='none';loadChanges();}
-  else{sv.style.display='none';lv.style.display='';}
+// ── 视图状态机 ────────────────────────────────────────
+// 之前用 toggleSub 三元判断，从详情页进订阅再返回会错乱，且订阅页没有出口。
+// 统一走 go(view)：'list' | 'sub'，详情页由 openDetail/backList 管。
+// 顶部导航始终可见，任何页面都能一键回主页。
+function go(view){
+  $('#listView').style.display = view==='list' ? '' : 'none';
+  $('#subView').style.display  = view==='sub'  ? '' : 'none';
+  $('#detailView').style.display = 'none';
+  if(view==='sub') loadChanges();
+  window.scrollTo(0,0);
 }
+document.querySelector('.h-sub').innerHTML+=
+  '<span style="color:var(--acc);cursor:pointer;padding:2px 4px" onclick="go(\'sub\')">📌 订阅</span>'+
+  '<span style="color:var(--mut);cursor:pointer;padding:2px 4px" onclick="go(\'list\')">🏠 主页</span>';
+
+// ── 测试钩子（E2E 用，不影响 UI）─────────────────────
+window.D_STATS_ALIVE = () => (CACHE && CACHE.stats && CACHE.stats.alive) || 0;
+window.D_CACHE = () => CACHE;
 
 load();
 setInterval(load, 60000);

@@ -241,12 +241,15 @@ def init_db(path):
         site TEXT, keyword TEXT, note TEXT, created_at TEXT, active INTEGER DEFAULT 1
     );
     """)
-    # 老库兼容：补列
+    # 老库兼容：补列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）
+    # 注意：所有新增列都必须登记在这里，否则老库升级后会缺列报错。
     for tbl, col, ddl in [
         ("listings", "sold_at", "TEXT DEFAULT NULL"),
         ("status_changes", "pushed_at", "TEXT DEFAULT NULL"),
         ("snapshots", "sold", "INTEGER DEFAULT 0"),
         ("snapshots", "alive", "INTEGER DEFAULT 0"),
+        ("snapshots", "fetched", "INTEGER DEFAULT 0"),
+        ("snapshots", "dtot", "INTEGER DEFAULT 0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ddl}")
@@ -368,12 +371,6 @@ def main():
     #   total   = 本轮实际抓到的行数（旧代码写错了语义，保留兼容不动）
     #   fetched = 同上，语义明确的别名
     #   dtot    = 站点页面报的数据集总条数（"共 N 条"）
-    for col, ddl in [("fetched", "INTEGER DEFAULT 0"), ("dtot", "INTEGER DEFAULT 0")]:
-        try:
-            conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col} {ddl}")
-        except sqlite3.OperationalError:
-            pass
-
     conn.execute(
         "INSERT INTO snapshots (site,taken_at,query,total,new,changed,sold,alive,fetched,dtot)"
         " VALUES (?,?,?,?,?,?,?,?,?,?)",
