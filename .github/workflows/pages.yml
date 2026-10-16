@@ -1,10 +1,12 @@
-name: 部署看板到 GitHub Pages
+name: 测试与部署看板
 
 on:
   push:
     branches: [main]
     paths:
       - 'web/**'
+      - 'scripts/**'
+      - 'tests/**'
       - '.github/workflows/pages.yml'
   workflow_run:
     # 抓取工作流完成后自动重新部署（让新数据立刻上线）
@@ -22,13 +24,51 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ── 门禁：测试不过就不部署 ──────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 单元测试（纯函数 / 数据库 / 增量逻辑）
+        run: python -m unittest discover -s tests -p 'test_unit.py' -v
+
+      - name: 前端静态检查（JS 语法 / 订阅交互 / 视图切换）
+        run: python tests/test_frontend_lint.py
+
+      - name: 安装 Chromium（E2E 用）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq chromium-browser || sudo apt-get install -y -qq chromium
+          (which chromium-browser || which chromium) > /tmp/chrome_path.txt
+          cat /tmp/chrome_path.txt
+
+      - name: 端到端测试（真实浏览器点一遍：订阅增删 / 视图切换 / 排序）
+        run: |
+          export CHROME_PATH="$(cat /tmp/chrome_path.txt)"
+          echo "使用浏览器: $CHROME_PATH"
+          python tests/test_e2e.py
+
+  # ── 部署（依赖 test 通过）────────────────────────────
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: 校验产物（避免部署空白页）
+        run: |
+          test -f web/index.html || { echo "web/index.html 缺失"; exit 1; }
+          test -f web/data.json   || { echo "web/data.json 缺失"; exit 1; }
+          python -c "import json;d=json.load(open('web/data.json'));assert d.get('projects'),'数据为空';print('数据校验通过:',len(d['projects']),'个项目')"
 
       - uses: actions/configure-pages@v5
 
