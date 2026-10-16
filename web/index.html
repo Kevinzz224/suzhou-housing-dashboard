@@ -117,7 +117,7 @@ td.r,th.r{text-align:right}
       <button onclick="addSub()">订阅</button>
     </div>
     <div class="sec">
-      <h3>我的订阅 <em>每日抓取后自动推送销售变化</em></h3>
+      <h3>我的订阅 <em>存在本机 · 换设备需重加</em></h3>
       <div class="chips" id="subs"></div>
     </div>
     <div class="sec">
@@ -178,7 +178,7 @@ async function load(){
   const [st,pr,su]=await Promise.all([
     J('/api/stats'), J('/api/projects'), J('/api/subscriptions'),
   ]);
-  PRO=pr; SUBS=su;
+  PRO=pr; SUBS=mergeSubs(su);
   // 头部
   $('#lastcrawl').textContent = st.last_crawl ? '更新于 '+st.last_crawl.slice(5,16) : '';
   $('#snapinfo').textContent = (MODE==='static'?'静态数据 · ':'') + '快照 '+st.snapshot_count+' 次';
@@ -201,10 +201,13 @@ function renderList(){
              sold:(a,b)=>b.sold-a.sold, rate:(a,b)=>(b.sell_rate||0)-(a.sell_rate||0)};
   sorted.sort(cmp[sortKey]||cmp.alive);
   if(!sorted.length){$('#projects').innerHTML='<div class="empty">暂无数据，先跑一次爬虫~</div>';return}
+  const subs=new Set((SUBS||[]).map(s=>s.keyword));
+  // 订阅楼盘置顶（用户最关心的放最前）
+  sorted.sort((a,b)=>(subs.has(b.project)?1:0)-(subs.has(a.project)?1:0));
   $('#projects').innerHTML=sorted.map(p=>`
-    <div class="card" onclick="openDetail('${esc(p.project)}')">
+    <div class="card" onclick="openDetail('${esc(p.project)}')"${subs.has(p.project)?' style="border-color:var(--acc)"':''}>
       <div class="row1">
-        <div class="pname">${esc(p.project)}<span class="sub">${esc(p.company||'')}</span></div>
+        <div class="pname">${subs.has(p.project)?'★ ':''}${esc(p.project)}<span class="sub">${esc(p.company||'')}</span></div>
         <div class="badge"><div class="n">${fmt(p.alive)}</div><div class="t">在售套</div></div>
       </div>
       <div class="metrics">
@@ -299,6 +302,21 @@ function sparkline(snaps){
   </svg>`;
 }
 
+/* ── 订阅：localStorage 为准 ───────────────────────
+   静态托管没有数据库，但订阅本质是「你手机上的收藏」，存本机完全够用，
+   而且离线也能看。本地跑 serve.py 时会额外同步到服务端（用于推送）。 */
+const LSK = 'sz_subs_v1';
+function localSubs(){ try{ return JSON.parse(localStorage.getItem(LSK)||'[]'); }catch(e){ return []; } }
+function saveLocalSubs(a){ try{ localStorage.setItem(LSK, JSON.stringify(a)); }catch(e){} }
+function mergeSubs(remote){
+  const L = localSubs();
+  const seen = new Set(L.map(s=>s.keyword));
+  for(const r of (remote||[])) if(r.keyword && !seen.has(r.keyword)){
+    L.push({id:'r'+r.id, keyword:r.keyword, note:r.note||'', remote:true}); seen.add(r.keyword);
+  }
+  saveLocalSubs(L); return L;
+}
+
 async function loadChanges(){
   try{
     const r=await J('/api/changes');
@@ -317,16 +335,25 @@ function renderSubs(){
 async function addSub(){
   const kw=$('#kwInput').value.trim();
   if(!kw) return toast('先输入楼盘关键词~');
-  if(MODE==='static') return toast('静态托管模式：订阅请到 GitHub Issue 留言，或本地运行 serve.py');
-  await fetch('/api/subscriptions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyword:kw})});
+  const L=localSubs();
+  if(L.some(s=>s.keyword===kw)) return toast('已经订阅过啦~');
+  L.push({id:'L'+Date.now(), keyword:kw, note:''});
+  saveLocalSubs(L); SUBS=L; renderSubs(); renderList();
   $('#kwInput').value='';
-  toast('已订阅 '+kw+' ★');
-  SUBS=await J('/api/subscriptions'); renderSubs();
+  toast('已订阅 '+kw+' ★（存在本机）');
+  if(MODE==='api'){
+    try{ await fetch('/api/subscriptions',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({keyword:kw})}); }catch(e){}
+  }
 }
 async function delSub(id){
-  if(MODE==='static') return toast('静态托管模式：请在 GitHub 上管理订阅');
-  await fetch('/api/subscriptions/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
-  SUBS=await fetch('/api/subscriptions').then(r=>r.json()); renderSubs(); toast('已取消订阅');
+  let L=localSubs().filter(s=>String(s.id)!==String(id));
+  saveLocalSubs(L); SUBS=L; renderSubs(); renderList();
+  toast('已取消订阅');
+  if(MODE==='api' && String(id).startsWith('r')){
+    try{ await fetch('/api/subscriptions/delete',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({id:String(id).slice(1)})}); }catch(e){}
+  }
 }
 
 // tabs

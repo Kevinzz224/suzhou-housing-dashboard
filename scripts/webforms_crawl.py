@@ -30,6 +30,18 @@ import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def now_cn():
+    """统一的北京时间戳。
+    关键：GitHub Actions runner 是 UTC，本地是 UTC+8。两边都写本地时间会让
+    快照混入两种时区，按字符串排序后曲线会前后颠倒（实测踩过）。
+    所以一律换算成 UTC+8 再落库。"""
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone.utc).astimezone(
+        timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
 
@@ -172,7 +184,7 @@ class Site:
 def db_upsert(conn, site_name, rows, site):
     """增量入库：新记录插入；已存在则更新 last_seen_at，状态变化记 status_changes。"""
     cur = conn.cursor()
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    now = now_cn()
     new, changed = 0, 0
     for r in rows:
         key = r.get(site.key_field)
@@ -352,11 +364,21 @@ def main():
         "SELECT COUNT(*) FROM listings WHERE site=? AND sold_at IS NULL", (site.name,))
     alive = cur.fetchone()[0]
 
+    # 字段语义（历史包袱说明）：
+    #   total   = 本轮实际抓到的行数（旧代码写错了语义，保留兼容不动）
+    #   fetched = 同上，语义明确的别名
+    #   dtot    = 站点页面报的数据集总条数（"共 N 条"）
+    for col, ddl in [("fetched", "INTEGER DEFAULT 0"), ("dtot", "INTEGER DEFAULT 0")]:
+        try:
+            conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col} {ddl}")
+        except sqlite3.OperationalError:
+            pass
+
     conn.execute(
-        "INSERT INTO snapshots (site,taken_at,query,total,new,changed,sold,alive)"
-        " VALUES (?,?,?,?,?,?,?,?)",
-        (site.name, time.strftime("%Y-%m-%d %H:%M:%S"), json.dumps(params, ensure_ascii=False),
-         all_rows, n_new, n_chg, n_sold, alive),
+        "INSERT INTO snapshots (site,taken_at,query,total,new,changed,sold,alive,fetched,dtot)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (site.name, now_cn(), json.dumps(params, ensure_ascii=False),
+         all_rows, n_new, n_chg, n_sold, alive, all_rows, total or 0),
     )
     conn.commit()
     print(f"[done] 本次 {all_rows} 行入库; 失败页: {failed_pages or '无'}; 库存在售 {alive} 套")

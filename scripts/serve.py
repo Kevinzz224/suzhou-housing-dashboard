@@ -45,6 +45,14 @@ def project_of(location):
     return head or "未知"
 
 
+def _table_cols(conn, table):
+    """取表的列名集合（用于兼容老库缺列的情况）。"""
+    try:
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.OperationalError:
+        return set()
+
+
 def q(conn, sql, args=()):
     cur = conn.execute(sql, args)
     cols = [d[0] for d in cur.description] if cur.description else []
@@ -106,9 +114,12 @@ def api_project(conn, name, days=30):
         """最近 d 天内成交的：sold_at 落在窗口内；新房源：first_seen_at 落在窗口内。"""
         return within(r, d, "sold_at")
 
-    # 快照序列（存量曲线）
+    # 快照序列（项目级曲线用的是全库快照——站点一次查询就是整个筛选集，
+    # 所以项目曲线与全局曲线同源；alive=0 的历史坏快照必须剔除）
     snaps = q(conn, "SELECT taken_at, alive, sold, total FROM snapshots ORDER BY taken_at")
-    snaps = [s for s in snaps if s["taken_at"] >= (now - timedelta(days=days)).strftime("%Y-%m-%d")]
+    snaps = [s for s in snaps
+             if s.get("alive") not in (None, 0)
+             and s["taken_at"] >= (now - timedelta(days=days)).strftime("%Y-%m-%d")]
 
     sold7 = [r for r in rows if in_range(r, 7)]
     sold30 = [r for r in rows if in_range(r, 30)]
@@ -166,14 +177,28 @@ def api_project(conn, name, days=30):
 
 
 def api_trend(conn, days=30):
+    """全局存量曲线。
+
+    过滤 alive IS NULL 或 0 的快照：alive 列是后期加的，ALTER TABLE 给历史行
+    填的默认值是 0，直接画会让曲线突然掉到 0（表现为"455 -> 0"的假暴跌）。
+    历史行没有可用的在售数，只能剔除；宁可曲线短一点也不画假数据。
+    """
     now = datetime.now()
-    snaps = q(conn, "SELECT taken_at, alive, sold, total FROM snapshots ORDER BY taken_at")
+    cols = _table_cols(conn, "snapshots")
+    has_new = "fetched" in cols and "dtot" in cols
+    sel = ("taken_at, alive, sold, total, fetched, dtot" if has_new
+           else "taken_at, alive, sold, total")
+    snaps = q(conn, f"SELECT {sel} FROM snapshots ORDER BY taken_at")
     out = []
     for s in snaps:
+        if s.get("alive") in (None, 0):
+            continue
         if s["taken_at"][:10] < (now - timedelta(days=days)).strftime("%Y-%m-%d"):
             continue
-        out.append({"date": s["taken_at"][:10], "time": s["taken_at"][11:16],
-                    "alive": s["alive"], "sold": s["sold"], "total": s["total"]})
+        item = {"date": s["taken_at"][:10], "time": s["taken_at"][11:16],
+                "alive": s["alive"], "sold": s["sold"],
+                "dataset_total": s["dtot"] if has_new else s["total"]}
+        out.append(item)
     return out
 
 
@@ -182,10 +207,12 @@ def api_stats(conn):
     sold = conn.execute("SELECT COUNT(*) FROM listings WHERE sold_at IS NOT NULL").fetchone()[0]
     total = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
     last = conn.execute("SELECT MAX(taken_at) FROM snapshots").fetchone()[0]
-    # 最近一次快照相对上一次的变化
-    snaps = q(conn, "SELECT taken_at, alive, sold FROM snapshots ORDER BY taken_at DESC LIMIT 2")
+    # 最近一次快照相对上一次的变化（只比较有效快照，避免和 alive=0 的历史行相减）
+    snaps = [s for s in q(conn, "SELECT taken_at, alive, sold FROM snapshots"
+                               " ORDER BY taken_at DESC LIMIT 10")
+             if s.get("alive") not in (None, 0)]
     delta = None
-    if len(snaps) == 2:
+    if len(snaps) >= 2:
         delta = {"alive": snaps[0]["alive"] - snaps[1]["alive"],
                  "sold": snaps[0]["sold"] - snaps[1]["sold"]}
     today = datetime.now().strftime("%Y-%m-%d")
