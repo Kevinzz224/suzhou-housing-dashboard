@@ -33,16 +33,45 @@ DB = None
 
 
 def project_of(location):
-    """从"苏州工业园区八达街108号天熠星湖雅苑2幢702"提取项目名。
-    策略：取"幢"前的部分，再去掉开头的"苏州工业园区+路名+号"。"""
+    """从"苏州工业园区八达街108号天熠星湖雅苑2幢702"提取楼盘名。
+
+    坑：有些地址在「号」与「幢」之间**没有楼盘名**（如"万寿街168号3幢2402"，
+    那是老小区/自建房），旧实现会把门牌号当成楼盘名或返回空 -> 显示"未知"。
+    这里对这种情况回退到路名 + "（待补）"标注，而不是静默丢成"未知"。
+    """
     if not location:
         return "未知"
     head = location.split("幢")[0] if "幢" in location else location
-    m = re.match(r"^苏州工业园区[^号]*号(.+)$", head)
+    m = re.match(r"^苏州工业园区(.*?号)(.*)$", head)
     if m:
-        head = m.group(1)
-    head = re.sub(r"\d+$", "", head).strip()
-    return head or "未知"
+        head = m.group(2)                      # 取「号」之后的部分
+    head = re.sub(r"^\d+", "", head)            # 去掉纯数字楼栋号（如 "3"）
+    head = re.sub(r"\d+$", "", head).strip()    # 去掉尾部数字
+    if head and re.search(r"[\u4e00-\u9fa5A-Za-z]", head):
+        return head
+    # 号与幢之间无名称：用路名兜底，并标注待补
+    fb = re.match(r"^苏州工业园区(.*?)\d*号", location)
+    return (fb.group(1) + "（待补）") if fb else "未知"
+
+
+def apply_alias(name, cfg_alias):
+    """把备案名换成推广名（联网核实的映射，找不到就用备案名）。"""
+    return (cfg_alias or {}).get(name) or name
+
+
+_ALIAS_CACHE = None
+
+
+def _load_alias():
+    """读站点配置里的 name_alias（备案名 -> 推广名）。"""
+    global _ALIAS_CACHE
+    if _ALIAS_CACHE is None:
+        try:
+            cfg = json.load(open(os.path.join(HERE, "sites", "suzhou.json"), encoding="utf-8"))
+            _ALIAS_CACHE = cfg.get("name_alias") or {}
+        except Exception:
+            _ALIAS_CACHE = {}
+    return _ALIAS_CACHE
 
 
 def _table_cols(conn, table):
@@ -66,11 +95,13 @@ def api_projects(conn, site=None):
         sql += " AND site=?"
         args.append(site)
     rows = q(conn, sql, args)
+    alias = _load_alias()
     agg = {}
     for r in rows:
         proj = project_of(r.get("location"))
         a = agg.setdefault(proj, {
-            "project": proj, "alive": 0, "sold": 0, "total": 0,
+            "project": proj, "display": apply_alias(proj, alias),
+            "alive": 0, "sold": 0, "total": 0,
             "prices": [], "areas": [], "company": r.get("company") or "",
         })
         a["total"] += 1
@@ -142,6 +173,7 @@ def api_project(conn, name, days=30):
 
     return {
         "project": name,
+        "display": apply_alias(name, _load_alias()),
         "company": rows[0].get("company") or "",
         "alive": len(alive),
         "sold_total": len(sold),

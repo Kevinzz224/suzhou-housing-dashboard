@@ -16,5 +16,37 @@
     "price": "price"
   },
   "row_regex": "<tr[^>]*>\\s*<td[^>]*onclick=\"javascript:window\\.showModalDialog\\(&#39;SaleInfoHouseView\\.aspx\\?SHSE_ID=(?P<shse>[^&]+)&#39;[^>]*>(?P<loc>.*?)</td>\\s*<td[^>]*onclick=\"javascript:window\\.showModalDialog\\(&#39;ComPanyView\\.aspx\\?C_ID=(?P<cid>[^&]+)&#39;[^>]*>(?P<comp>.*?)</td>\\s*<td[^>]*>(?P<usage>.*?)</td>\\s*<td[^>]*>(?P<layout>.*?)</td>\\s*<td[^>]*>(?P<area>[\\d.]+)</td>\\s*<td[^>]*>(?P<price>[\\d.]+)</td>\\s*</tr>",
-  "note": "SHSE_ID 形如 51027.10.2002_MD001 = 项目ID.楼栋.房号_用途码，天然唯一键。查询参数：ddl_qy=RD002(工业园区)/RD001(姑苏)/RD003(吴中)/RD004(相城)/RD005(高新)/RD008(吴江); ddl_houseclass=1(住宅)/2(非住宅); rb_HF_CODE=-1(全部)/全装修房/毛坯房; txt_Area1/txt_Area2 面积闭区间; txt_Price1/txt_Price2 总价; txt_Pro 项目名; txt_Com 公司名。"
+  "note": "SHSE_ID 形如 51027.10.2002_MD001 = 项目ID.楼栋.房号_用途码，天然唯一键。查询参数：ddl_qy=RD002(工业园区)/RD001(姑苏)/RD003(吴中)/RD004(相城)/RD005(高新)/RD008(吴江); ddl_houseclass=1(住宅)/2(非住宅); rb_HF_CODE=-1(全部)/全装修房/毛坯房; txt_Area1/txt_Area2 面积闭区间; txt_Price1/txt_Price2 总价; txt_Pro 项目名; txt_Com 公司名。",
+  "name_alias": {
+    "叠景星园": "苏州道壹号",
+    "天熠星湖雅苑": "象屿天熠东方",
+    "新棠雅筑": "建屋新棠玥",
+    "凤起潮鸣苑": "绿城凤起潮鸣",
+    "吴风和苑": "朗诗吴风和苑",
+    "沁百合花园": "绿城沁百合",
+    "庭樾雅园": "",
+    "臻和璟园": "招商臻和璟园",
+    "紫金翡丽雅筑": "紫金·翡丽甲第"
+  },
+  "no_alias_needed": [
+    "紫云台大厦",
+    "天朗汇庭",
+    "君华雅筑",
+    "金匙望湖大厦",
+    "苏州国际金融中心",
+    "亭苑",
+    "青剑湖花园",
+    "鑫能商务广场",
+    "至和云筑",
+    "独墅湖西璀璨璟园",
+    "嘉怡生活广场",
+    "天誉东方雅苑",
+    "淞泽家园八区",
+    "双湖湾花园",
+    "润华环球大厦",
+    "荷韵新村",
+    "溪云春晓华庭",
+    "颐和源璟花园",
+    "未知"
+  ]
 }

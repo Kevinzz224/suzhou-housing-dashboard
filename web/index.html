@@ -207,7 +207,7 @@ function renderList(){
   $('#projects').innerHTML=sorted.map(p=>`
     <div class="card" onclick="openDetail('${esc(p.project)}')"${subs.has(p.project)?' style="border-color:var(--acc)"':''}>
       <div class="row1">
-        <div class="pname">${subs.has(p.project)?'★ ':''}${esc(p.project)}<span class="sub">${esc(p.company||'')}</span></div>
+        <div class="pname">${subs.has(p.project)?'★ ':''}${esc(p.display||p.project)}<span class="sub">${esc(p.display&&p.display!==p.project?'备案名 '+p.project:'')}${p.display&&p.display!==p.project?' · ':''}${esc(p.company||'')}</span></div>
         <div class="badge"><div class="n">${fmt(p.alive)}</div><div class="t">在售套</div></div>
       </div>
       <div class="metrics">
@@ -233,8 +233,8 @@ async function openDetail(name){
   dv.innerHTML=`
     <div class="back" onclick="backList()">‹ 返回列表</div>
     <div class="d-head">
-      <h2>${esc(d.project)}</h2>
-      <div class="co">${esc(d.company)}</div>
+      <h2>${esc(d.display||d.project)}</h2>
+      <div class="co">${d.display&&d.display!==d.project?'备案名 '+esc(d.project)+' · ':''}${esc(d.company)}</div>
       <div class="kv">
         <div><b style="color:var(--acc)">${fmt(d.alive)}</b><span>在售套数</span></div>
         <div><b style="color:var(--up)">${fmt(d.sold_total)}</b><span>累计已售</span></div>
