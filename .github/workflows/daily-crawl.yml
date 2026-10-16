@@ -1,0 +1,66 @@
+name: 每日抓取苏州楼市数据
+
+on:
+  schedule:
+    # GitHub Actions 用 UTC。北京时间 9:00 = UTC 1:00。
+    # 注意：GitHub 定时任务在高峰期可能延迟 5~30 分钟，属正常现象。
+    - cron: '0 1 * * *'
+  workflow_dispatch:      # 支持手动触发
+  push:
+    branches: [main]
+    paths:                # 代码改动时也跑一次，便于验证
+      - 'scripts/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: write         # 需要提交数据回仓库
+
+concurrency:
+  group: daily-crawl
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 零第三方依赖：只用标准库，不需要 pip install
+      - name: 抓取数据
+        run: |
+          python scripts/webforms_crawl.py \
+            --site scripts/sites/suzhou.json \
+            --db data/housing.db \
+            --param ddl_qy=RD002 \
+            --param txt_Area1=140 \
+            --param txt_Area2=180 \
+            --param ddl_houseclass=1 \
+            --param rb_HF_CODE=-1 \
+            --param txt_Pro= \
+            --param txt_Com= \
+            --param txt_Price1= \
+            --param txt_Price2= \
+            --interval 1.2
+
+      - name: 导出静态 JSON
+        run: |
+          python scripts/export_static.py \
+            --db data/housing.db \
+            --out web/data.json
+
+      - name: 提交数据变更
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add web/data.json data/housing.db
+          if git diff --staged --quiet; then
+            echo "数据无变化，跳过提交"
+          else
+            git commit -m "chore(data): 每日更新 $(date -u +%Y-%m-%d)"
+            git push
+          fi

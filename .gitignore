@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行产物
+proxy_state.json
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 注意：data/housing.db 和 web/data.json 需要提交（GitHub Actions 靠它们累积历史）

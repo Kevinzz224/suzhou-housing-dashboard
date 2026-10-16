@@ -1,0 +1,20 @@
+{
+  "name": "suzhou-cansale",
+  "entry": "http://spf.zfcjj.suzhou.gov.cn:8089/szfcweb/DataSerach/CanSaleHouseSelectIndex.aspx",
+  "key_field": "key_id",
+  "status_field": null,
+  "total_regex": "共\\s*(\\d+)\\s*条",
+  "pager_target": "ctl00$MainContent$PageGridView1$ctl22$PageList",
+  "pager_field": "ctl00$MainContent$PageGridView1$ctl22$PageList",
+  "fields": {
+    "key_id": "shse",
+    "location": "loc",
+    "company": "comp",
+    "usage": "usage",
+    "layout": "layout",
+    "area": "area",
+    "price": "price"
+  },
+  "row_regex": "<tr[^>]*>\\s*<td[^>]*onclick=\"javascript:window\\.showModalDialog\\(&#39;SaleInfoHouseView\\.aspx\\?SHSE_ID=(?P<shse>[^&]+)&#39;[^>]*>(?P<loc>.*?)</td>\\s*<td[^>]*onclick=\"javascript:window\\.showModalDialog\\(&#39;ComPanyView\\.aspx\\?C_ID=(?P<cid>[^&]+)&#39;[^>]*>(?P<comp>.*?)</td>\\s*<td[^>]*>(?P<usage>.*?)</td>\\s*<td[^>]*>(?P<layout>.*?)</td>\\s*<td[^>]*>(?P<area>[\\d.]+)</td>\\s*<td[^>]*>(?P<price>[\\d.]+)</td>\\s*</tr>",
+  "note": "SHSE_ID 形如 51027.10.2002_MD001 = 项目ID.楼栋.房号_用途码，天然唯一键。查询参数：ddl_qy=RD002(工业园区)/RD001(姑苏)/RD003(吴中)/RD004(相城)/RD005(高新)/RD008(吴江); ddl_houseclass=1(住宅)/2(非住宅); rb_HF_CODE=-1(全部)/全装修房/毛坯房; txt_Area1/txt_Area2 面积闭区间; txt_Price1/txt_Price2 总价; txt_Pro 项目名; txt_Com 公司名。"
+}
