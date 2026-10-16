@@ -69,8 +69,28 @@ th{color:var(--mut);font-weight:500;text-align:left;padding:6px 4px;border-botto
 td{padding:7px 4px;border-bottom:1px solid rgba(38,49,77,.5);font-variant-numeric:tabular-nums}
 tr:last-child td{border-bottom:none}
 td.r,th.r{text-align:right}
+/* 卡片星标订阅按钮 */
+.star{background:transparent;border:1px solid var(--line);color:var(--mut);border-radius:8px;
+  width:28px;height:28px;font-size:15px;line-height:1;cursor:pointer;margin-top:5px;
+  transition:.15s;padding:0}
+.star:hover{border-color:var(--acc);color:var(--acc)}
+.star.on{background:rgba(79,140,255,.15);border-color:var(--acc);color:var(--acc)}
 /* 订阅 */
-.sub-input{display:flex;gap:8px;margin-bottom:12px}
+.sub-input{display:flex;gap:8px;margin-bottom:12px;align-items:flex-start}
+.kw-wrap{flex:1;position:relative}
+.kw-wrap input{width:100%}
+.suggest{display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:60;
+  background:var(--card2);border:1px solid var(--acc);border-radius:12px;overflow:hidden;
+  max-height:264px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.sug-item{padding:9px 12px;cursor:pointer;border-bottom:1px solid rgba(38,49,77,.5)}
+.sug-item:last-child{border-bottom:none}
+.sug-item:hover,.sug-item.on{background:var(--acc);color:#fff}
+.sug-main b{font-size:14px;font-weight:650}
+.sug-item:hover .sug-sub,.sug-item.on .sug-sub{color:rgba(255,255,255,.85)}
+.sug-tag{display:inline-block;font-size:9px;background:var(--acc);color:#fff;
+  border-radius:6px;padding:1px 5px;margin-left:6px;vertical-align:middle}
+.sug-item:hover .sug-tag,.sug-item.on .sug-tag{background:rgba(255,255,255,.28)}
+.sug-sub{display:block;font-size:10px;color:var(--mut);margin-top:2px}
 .sub-input input{flex:1;background:var(--card);border:1px solid var(--line);color:var(--tx);border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
 .sub-input input:focus{border-color:var(--acc)}
 .sub-input button{background:var(--acc);border:none;color:#fff;border-radius:10px;padding:0 16px;font-size:14px;font-weight:600;cursor:pointer}
@@ -114,7 +134,11 @@ td.r,th.r{text-align:right}
   <div id="subView" style="display:none">
     <div class="back" onclick="go('list')">‹ 返回主页</div>
     <div class="sub-input">
-      <input id="kwInput" placeholder="输入楼盘关键词，如：凤起潮鸣苑">
+      <div class="kw-wrap">
+        <input id="kwInput" placeholder="输入楼盘名 / 推广名 / 拼音首字母（如 jhyz）"
+               autocomplete="off">
+        <div class="suggest" id="suggest"></div>
+      </div>
       <button onclick="addSub()">订阅</button>
     </div>
     <div class="sec">
@@ -210,11 +234,15 @@ function renderList(){
   const subs=new Set((SUBS||[]).map(s=>s.keyword));
   // 订阅楼盘置顶（用户最关心的放最前）
   sorted.sort((a,b)=>(subs.has(b.project)?1:0)-(subs.has(a.project)?1:0));
-  $('#projects').innerHTML=sorted.map(p=>`
-    <div class="card" onclick="openDetail('${esc(p.project)}')"${subs.has(p.project)?' style="border-color:var(--acc)"':''}>
+  $('#projects').innerHTML=sorted.map(p=>{
+    const on=subs.has(p.project);
+    // 订阅按钮：stopPropagation 防止触发卡片跳详情
+    const star=`<button class="star${on?' on':''}" data-sub="${esc(p.project)}" title="${on?'取消订阅':'订阅'}">${on?'★':'☆'}</button>`;
+    return `
+    <div class="card" data-p="${esc(p.project)}"${on?' style="border-color:var(--acc)"':''}>
       <div class="row1">
-        <div class="pname">${subs.has(p.project)?'★ ':''}${esc(p.display||p.project)}<span class="sub">${esc(p.display&&p.display!==p.project?'备案名 '+p.project:'')}${p.display&&p.display!==p.project?' · ':''}${esc(p.company||'')}</span></div>
-        <div class="badge"><div class="n">${fmt(p.alive)}</div><div class="t">在售套</div></div>
+        <div class="pname">${esc(p.display||p.project)}<span class="sub">${esc(p.display&&p.display!==p.project?'备案名 '+p.project:'')}${p.display&&p.display!==p.project?' · ':''}${esc(p.company||'')}</span></div>
+        <div class="badge"><div class="n">${fmt(p.alive)}</div><div class="t">在售套</div>${star}</div>
       </div>
       <div class="metrics">
         <div class="m">均价 <b>${fmt(p.avg_price)}</b> 元/㎡</div>
@@ -224,7 +252,25 @@ function renderList(){
       </div>
       <div class="bar"><i style="width:${Math.min(100,p.sell_rate||0)}%"></i></div>
       <div class="bar-t"><span>已售 ${p.sold} / ${p.total}</span><span>${p.sell_rate}%</span></div>
-    </div>`).join('');
+    </div>`;}).join('');
+  // 星标绑定：必须用捕获阶段 + stopPropagation。
+  // 坑：卡片用的是 HTML 内联 onclick（属性），内联 handler 先于 addEventListener 注册，
+  // 冒泡阶段再 stopPropagation 已经晚了 —— 卡片仍会跳详情页（E2E 抓到的真 bug）。
+  // 捕获阶段在事件下行时拦截，才能真正阻止父级内联 handler。
+  const box=$('#projects');
+  box.querySelectorAll('.star').forEach(b=>{
+    b.addEventListener('click', ev=>{
+      ev.stopPropagation();
+      ev.preventDefault();
+      toggleSubByProject(b.dataset.sub);
+    }, true);   // ← capture
+  });
+  // 同时把卡片点击改成 JS 绑定，彻底避免内联/委托顺序问题
+  box.querySelectorAll('.card').forEach(c=>{
+    if(c._bound) return;
+    c._bound=true;
+    c.addEventListener('click', ()=>{ if(c.dataset.p) openDetail(c.dataset.p); });
+  });
 }
 
 function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -330,6 +376,119 @@ function mergeSubs(remote){
   saveLocalSubs(L); return L;
 }
 
+/* 主页星标：一键订阅/取消（用备案名做 key，与订阅体系一致） */
+function toggleSubByProject(name){
+  const L=localSubs();
+  const hit=L.findIndex(s=>s.keyword===name);
+  if(hit>=0){
+    L.splice(hit,1); saveLocalSubs(L); SUBS=L; renderSubs(); renderList();
+    toast('已取消订阅 '+name);
+  } else {
+    L.push({id:'L'+Date.now(), keyword:name, note:''});
+    saveLocalSubs(L); SUBS=L; renderSubs(); renderList();
+    toast('已订阅 '+name+' ★');
+  }
+}
+
+/* ── 搜索下拉候选 ────────────────────────────────────
+   输入关键词时就地匹配项目名/推广名/开发商，点击即填。
+   支持：中文包含匹配、拼音首字母（如 "jhyz" 命中 君华雅筑）、大小写不敏感。 */
+let SUG_IDX = -1;
+function matchProjects(kw){
+  const q = (kw||'').trim().toLowerCase();
+  if(!q) return [];
+  const out = [];
+  for(const p of PRO){
+    const names = [p.project, p.display||'', p.company||''];
+    let hit = names.some(n => n && n.toLowerCase().includes(q));
+    // 拼音首字母匹配（camel: 君华雅筑 -> jhyz）
+    if(!hit){
+      const initials = pinyinInitials(p.project) + pinyinInitials(p.display||'');
+      if(initials.includes(q)) hit = true;
+    }
+    if(hit) out.push(p);
+  }
+  // 订阅过的优先，其次在售多的靠前
+  const subs = new Set((SUBS||[]).map(s=>s.keyword));
+  out.sort((a,b)=>(subs.has(b.project)?1:0)-(subs.has(a.project)?1:0) || b.alive-a.alive);
+  return out.slice(0,8);
+}
+
+/* 极简拼音首字母表（覆盖楼盘名常用字）。不引第三方库，体积可控。 */
+const PY = {'阿':'a','安':'a','奥':'a','八':'b','百':'b','保':'b','碧':'b','滨':'b','铂':'b','博':'b',
+'彩':'c','沧':'c','岑':'c','常':'c','长':'c','朝':'c','潮':'c','城':'c','澄':'c','春':'c','翠':'c','璀':'c',
+'达':'d','大':'d','岛':'d','道':'d','地':'d','帝':'d','第':'d','叠':'d','东':'d','都':'d','独':'d','度':'d',
+'发':'f','方':'f','芳':'f','翡':'f','凤':'f','福':'f','富':'f','高':'g','阁':'g','工':'g','公':'g','馆':'g',
+'观':'g','光':'g','广':'g','国':'g','海':'h','涵':'h','豪':'h','昊':'h','和':'h','河':'h','荷':'h','恒':'h',
+'红':'h','宏':'h','虹':'h','湖':'h','华':'h','环':'h','汇':'h','慧':'h','嘉':'j','佳':'j','家':'j','江':'j',
+'金':'j','锦':'j','景':'j','璟':'j','九':'j','居':'j','君':'j','珺':'j','骏':'j','开':'k','康':'k','科':'k',
+'兰':'l','蓝':'l','澜':'l','朗':'l','乐':'l','丽':'l','莲':'l','联':'l','林':'l','领':'l','龙':'l','珑':'l',
+'庐':'l','路':'l','绿':'l','美':'m','门':'m','名':'m','明':'m','茗':'m','南':'n','宁':'n','品':'p','平':'p',
+'浦':'p','柒':'q','齐':'q','沁':'q','青':'q','清':'q','庆':'q','秋':'q','泉':'q','群':'q','人':'r','仁':'r',
+'日':'r','融':'r','如':'r','瑞':'r','润':'r','三':'s','森':'s','山':'s','上':'s','尚':'s','盛':'s','时':'s',
+'世':'s','首':'s','水':'s','顺':'s','思':'s','苏':'s','太':'t','唐':'t','桃':'t','天':'t','天':'t','庭':'t',
+'亭':'t','通':'t','同':'t','湾':'w','万':'w','望':'w','文':'w','吴':'w','熙':'x','溪':'x','西':'x','希':'x',
+'祥':'x','香':'x','向':'x','象':'x','新':'x','鑫':'x','星':'x','雅':'y','燕':'y','阳':'y','洋':'y','颐':'y',
+'怡':'y','壹':'y','银':'y','应':'y','映':'y','雍':'y','永':'y','优':'y','悠':'y','玉':'y','御':'y','源':'y',
+'远':'y','悦':'y','云':'y','韵':'y','泽':'z','尚':'z','招':'z','臻':'z','振':'z','中':'z','钟':'z','州':'z',
+'洲':'z','珠':'z','紫':'z','自':'z','族':'z','作':'z','箸':'z','筑':'z','起':'q','鸣':'m','苑':'y','熠':'y','号':'h','利':'l','赋':'f','岳':'y','麓':'l','栖':'q','棠':'t','禧':'x','樾':'y','琅':'l','屿':'y','峻':'j','宸':'c','璞':'p','玥':'y','均':'j','瑾':'j','瑧':'z','琚':'j','瑄':'x',};
+function pinyinInitials(s){
+  let out='';
+  for(const ch of (s||'')){
+    if(PY[ch]) out += PY[ch];
+    else if(/[a-z0-9]/i.test(ch)) out += ch.toLowerCase();
+  }
+  return out;
+}
+
+function renderSuggest(){
+  const kw = $('#kwInput').value;
+  const box = $('#suggest');
+  const list = matchProjects(kw);
+  if(!list.length){ box.style.display='none'; box.innerHTML=''; SUG_IDX=-1; return; }
+  const subs = new Set((SUBS||[]).map(s=>s.keyword));
+  box.innerHTML = list.map((p,i)=>{
+    const label = esc(p.display||p.project);
+    const sub = p.display&&p.display!==p.project ? `备案名 ${esc(p.project)}` : '';
+    const tag = subs.has(p.project) ? '<span class="sug-tag">已订阅</span>' : '';
+    return `<div class="sug-item" data-i="${i}" data-k="${esc(p.project)}">
+      <div class="sug-main"><b>${label}</b>${tag}<span class="sug-sub">${sub} ${p.alive} 套在售</span></div>
+    </div>`;
+  }).join('');
+  box.style.display='block';
+  SUG_IDX=-1;
+  box.querySelectorAll('.sug-item').forEach(el=>{
+    el.onclick=()=>{ $('#kwInput').value=el.dataset.k; pickFirstSuggest(); };
+    el.onmouseenter=()=>{ if(SUG_IDX>=0) box.children[SUG_IDX]?.classList.remove('on');
+      el.classList.add('on'); SUG_IDX=+el.dataset.i; };
+  });
+}
+function pickFirstSuggest(){
+  const list = matchProjects($('#kwInput').value);
+  if(list.length) $('#kwInput').value = list[0].project;
+  $('#suggest').style.display='none';
+}
+function suggestKey(ev){
+  const box = $('#suggest');
+  if(box.style.display!=='block') return;
+  const items = box.querySelectorAll('.sug-item');
+  if(ev.key==='ArrowDown' || ev.key==='ArrowUp'){
+    ev.preventDefault();
+    SUG_IDX = ev.key==='ArrowDown' ? Math.min(items.length-1, SUG_IDX+1)
+                                   : Math.max(0, SUG_IDX-1);
+    items.forEach((e,i)=>e.classList.toggle('on', i===SUG_IDX));
+    if(items[SUG_IDX]) $('#kwInput').value = items[SUG_IDX].dataset.k;
+  } else if(ev.key==='Enter'){
+    ev.preventDefault();
+    if(SUG_IDX<0) pickFirstSuggest();
+    else $('#kwInput').value = items[SUG_IDX].dataset.k;
+    box.style.display='none';
+    addSub();
+  } else if(ev.key==='Escape'){
+    box.style.display='none';
+  }
+}
+
 async function loadChanges(){
   try{
     const r=await J('/api/changes');
@@ -382,6 +541,20 @@ $('#tabs').addEventListener('click',e=>{
   t.classList.add('on'); sortKey=t.dataset.sort; renderList();
 });
 
+// ── 搜索输入绑定 ─────────────────────────────────────
+document.addEventListener('DOMContentLoaded', bindKw);
+function bindKw(){
+  const inp=$('#kwInput'); if(!inp || inp._bound) return; inp._bound=true;
+  inp.addEventListener('input', renderSuggest);
+  inp.addEventListener('focus', renderSuggest);
+  inp.addEventListener('keydown', suggestKey);
+  // 点击别处收起下拉
+  document.addEventListener('click', e=>{
+    if(!e.target.closest('.kw-wrap')) { const b=$('#suggest'); if(b) b.style.display='none'; }
+  });
+}
+if (document.readyState !== 'loading') bindKw();
+
 // ── 视图状态机 ────────────────────────────────────────
 // 之前用 toggleSub 三元判断，从详情页进订阅再返回会错乱，且订阅页没有出口。
 // 统一走 go(view)：'list' | 'sub'，详情页由 openDetail/backList 管。
@@ -390,7 +563,7 @@ function go(view){
   $('#listView').style.display = view==='list' ? '' : 'none';
   $('#subView').style.display  = view==='sub'  ? '' : 'none';
   $('#detailView').style.display = 'none';
-  if(view==='sub') loadChanges();
+  if(view==='sub'){ loadChanges(); setTimeout(()=>{ const i=$('#kwInput'); if(i) i.focus(); }, 60); }
   window.scrollTo(0,0);
 }
 document.querySelector('.h-sub').innerHTML+=

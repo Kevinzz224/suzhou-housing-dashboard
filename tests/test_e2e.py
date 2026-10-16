@@ -43,9 +43,14 @@ def find_chrome():
                     p = os.path.join(base, name, "chrome-win64", "chrome.exe")
                     if os.path.exists(p):
                         cands.append(p)
-    for env in ("CHROME_PATH", "CHROMIUM_PATH"):
+    for env in ("CHROME_PATH", "CHROMIUM_PATH", "GOOGLE_CHROME_SHIM"):
         if os.environ.get(env) and os.path.exists(os.environ[env]):
             cands.append(os.environ[env])
+    # Linux（CI runner）
+    for p in ("/usr/bin/chromium-browser", "/usr/bin/chromium",
+              "/usr/bin/google-chrome", "/snap/bin/chromium"):
+        if os.path.exists(p):
+            cands.append(p)
     return cands[0] if cands else None
 
 
@@ -152,22 +157,49 @@ class DashboardE2E(unittest.TestCase):
 
         # 2) 起 headless Chromium
         cls.profile = tempfile.mkdtemp(prefix="e2e_chrome_")
-        cls.proc = subprocess.Popen([
+        args = [
             cls.chrome, "--headless=new", "--disable-gpu", "--no-first-run",
-            "--remote-debugging-port=0", f"--user-data-dir={cls.profile}",
+            "--no-default-browser-check", "--disable-extensions",
+            # Linux CI（root 用户 + 容器）必须关沙箱，否则进程直接退出，
+            # 表现为读不到 DevToolsActivePort（CI 实战踩到）
+            "--no-sandbox", "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",          # 容器 /dev/shm 太小
+            "--disable-background-networking",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",
+            f"--user-data-dir={cls.profile}",
             "--window-size=390,844", "about:blank",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ]
+        # 日志留着，启动失败时能看出原因（而不是只说"读不到端口"）
+        cls.chrome_log = os.path.join(cls.profile, "chrome.log")
+        cls._log_fh = open(cls.chrome_log, "wb")
+        cls.proc = subprocess.Popen(args, stdout=cls._log_fh, stderr=cls._log_fh)
 
-        # 从 DevToolsActivePort 文件读真实端口
+        # 从 DevToolsActivePort 文件读真实端口（最多等 90 秒，CI 慢）
         port_file = os.path.join(cls.profile, "DevToolsActivePort")
-        for _ in range(120):
+        for _ in range(360):
             if os.path.exists(port_file):
                 with open(port_file) as f:
-                    cls.cdp_port = int(f.read().splitlines()[0])
+                    first = f.read().splitlines()
+                if first:
+                    cls.cdp_port = int(first[0])
+                    break
+            if cls.proc.poll() is not None:      # 进程已退出，别白等
                 break
             time.sleep(0.25)
         else:
-            raise RuntimeError("Chromium 未启动（读不到 DevToolsActivePort）")
+            cls.cdp_port = None
+
+        if not getattr(cls, "cdp_port", None):
+            log = ""
+            try:
+                with open(cls.chrome_log, "rb") as f:
+                    log = f.read().decode("utf-8", "ignore")[-1500:]
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"Chromium 未启动（binary={cls.chrome}, rc={cls.proc.poll()}）\n"
+                f"--- chrome 日志 ---\n{log}")
 
         # 3) 拿页面 target
         with urllib.request.urlopen(
@@ -184,6 +216,10 @@ class DashboardE2E(unittest.TestCase):
             cls.cdp.close()
         except Exception:
             pass
+        try:
+            cls._log_fh.close()
+        except Exception:
+            pass
         cls.proc.terminate()
         try:
             cls.proc.wait(timeout=10)
@@ -197,6 +233,16 @@ class DashboardE2E(unittest.TestCase):
         self.wait_for("typeof window.go === 'function' && typeof PRO !== 'undefined'")
         # 等数据加载完（PRO 有内容）
         self.wait_for("Array.isArray(PRO) && PRO.length > 0", timeout=15)
+
+    def visible(self, sel):
+        """元素是否真的可见。必须用 computed style：
+        内联 style.display 为空时，可能是 CSS 在隐藏（.detail{display:none}），
+        只看内联会误判为"可见"（踩过）。"""
+        return self.cdp.eval(
+            f"(()=>{{const e=document.querySelector('{sel}');"
+            f"if(!e) return false;"
+            f"const s=getComputedStyle(e);"
+            f"return s.display!=='none' && s.visibility!=='hidden';}})()")
 
     def wait_for(self, expr, timeout=12):
         deadline = time.time() + timeout
@@ -305,7 +351,10 @@ class DashboardE2E(unittest.TestCase):
         self.assertEqual(self.cdp.eval("localSubs().length"), 1)
 
     def test_33_subscribed_project_is_pinned(self):
-        """订阅的楼盘必须置顶 + 加 ★。"""
+        """订阅的楼盘必须置顶，且星标变实心 ★。
+
+        注意：★ 现在位于卡片右上角的订阅按钮内（不再塞进楼盘名文本），
+        断言也要跟着改 —— 否则测试会因为界面改版而假失败。"""
         self.cdp.eval("go('sub')")
         target = self.cdp.eval("PRO[PRO.length-1].project")   # 原先排最后的
         self.cdp.eval(f"document.querySelector('#kwInput').value={json.dumps(target)}")
@@ -313,9 +362,13 @@ class DashboardE2E(unittest.TestCase):
         time.sleep(0.4)
         self.cdp.eval("go('list')")
         time.sleep(0.3)
-        first = self.cdp.eval("document.querySelector('#projects .card .pname').innerText")
-        self.assertIn(target, first)
-        self.assertIn("★", first)
+        # 置顶：第一张卡片的 data-p 就是订阅项目
+        first_key = self.cdp.eval("document.querySelector('#projects .card').dataset.p")
+        self.assertEqual(first_key, target, "订阅的楼盘应排到列表最前")
+        # 实心星标：第一张卡片的 .star 文本为 ★
+        self.assertEqual(
+            self.cdp.eval("document.querySelector('#projects .card .star').innerText"), "★",
+            "已订阅的楼盘星标应为实心")
 
     # ── 订阅页导航（另一个 bug：回不去主页）────────────────
 
@@ -348,6 +401,98 @@ class DashboardE2E(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual(self.cdp.eval("document.querySelector('#listView').style.display"), "")
         self.assertEqual(self.cdp.eval("document.querySelector('#detailView').style.display"), "none")
+
+    # ── 主页卡片订阅按钮（用户反馈缺这个）────────────────
+
+    def test_60_card_has_subscribe_button(self):
+        """主页每张卡片都要有 ☆ 订阅按钮（用户反馈没有）。"""
+        n_cards = self.cdp.eval("document.querySelectorAll('#projects .card').length")
+        n_stars = self.cdp.eval("document.querySelectorAll('#projects .star').length")
+        self.assertEqual(n_stars, n_cards, "每张卡片都应有一个订阅星标按钮")
+        self.assertEqual(self.cdp.eval("document.querySelector('#projects .star').innerText"), "☆")
+
+    def test_61_card_star_toggles_subscription(self):
+        """点星标要能订阅/取消，且不能触发卡片跳详情页。"""
+        self.cdp.eval("document.querySelector('#projects .star').click()")
+        self.wait_for("localSubs().length === 1")
+        # 关键：不应跳到详情页（事件冒泡没阻止的话会跳）
+        self.assertFalse(self.visible("#detailView"), "点星标不应触发卡片跳转详情页")
+        self.assertEqual(self.cdp.eval("view"), "list", "点星标后视图应仍在列表")
+        self.assertEqual(self.cdp.eval("document.querySelector('#projects .star').innerText"), "★")
+        # 再点一次取消
+        self.cdp.eval("document.querySelector('#projects .star').click()")
+        self.wait_for("localSubs().length === 0")
+        self.assertEqual(self.cdp.eval("document.querySelector('#projects .star').innerText"), "☆")
+
+    # ── 搜索下拉候选（用户反馈缺这个）──────────────────
+
+    def test_70_search_shows_suggestions(self):
+        """输入关键词要弹出匹配下拉。"""
+        self.cdp.eval("go('sub')")
+        self.cdp.eval("""(()=>{const i=document.querySelector('#kwInput');
+            i.value='凤起'; i.dispatchEvent(new Event('input',{bubbles:true}));})()""")
+        self.wait_for("document.querySelector('#suggest').style.display === 'block'")
+        n = self.cdp.eval("document.querySelectorAll('#suggest .sug-item').length")
+        self.assertGreater(n, 0, "输入'凤起'应有候选")
+        self.assertIn("凤起", self.cdp.eval("document.querySelector('#suggest').innerText"))
+
+    def test_71_suggest_matches_alias_name(self):
+        """推广名也要能搜到（凤起潮鸣苑 的推广名是 绿城凤起潮鸣）。"""
+        self.cdp.eval("go('sub')")
+        self.cdp.eval("""(()=>{const i=document.querySelector('#kwInput');
+            i.value='道壹号'; i.dispatchEvent(new Event('input',{bubbles:true}));})()""")
+        self.wait_for("document.querySelector('#suggest').style.display === 'block'", timeout=8)
+        txt = self.cdp.eval("document.querySelector('#suggest').innerText")
+        self.assertIn("苏州道壹号", txt)
+
+    def test_72_suggest_matches_pinyin_initials(self):
+        """拼音首字母匹配：jhyz -> 君华雅筑。"""
+        self.cdp.eval("go('sub')")
+        self.cdp.eval("""(()=>{const i=document.querySelector('#kwInput');
+            i.value='jhyz'; i.dispatchEvent(new Event('input',{bubbles:true}));})()""")
+        self.wait_for("document.querySelector('#suggest').style.display === 'block'", timeout=8)
+        txt = self.cdp.eval("document.querySelector('#suggest').innerText")
+        self.assertIn("君华雅筑", txt)
+
+    def test_73_click_suggestion_fills_input(self):
+        """点候选要填入输入框。"""
+        self.cdp.eval("go('sub')")
+        self.cdp.eval("""(()=>{const i=document.querySelector('#kwInput');
+            i.value='君华'; i.dispatchEvent(new Event('input',{bubbles:true}));})()""")
+        self.wait_for("document.querySelectorAll('#suggest .sug-item').length > 0")
+        self.cdp.eval("document.querySelector('#suggest .sug-item').click()")
+        time.sleep(0.2)
+        self.assertEqual(self.cdp.eval("document.querySelector('#kwInput').value"), "君华雅筑")
+        self.assertEqual(self.cdp.eval("document.querySelector('#suggest').style.display"), "none")
+
+    def test_74_enter_subscribes_selected_suggestion(self):
+        """下拉里按回车 = 订阅该楼盘（键盘流）。"""
+        self.cdp.eval("go('sub')")
+        self.cdp.eval("""(()=>{const i=document.querySelector('#kwInput');
+            i.value='君华'; i.dispatchEvent(new Event('input',{bubbles:true}));})()""")
+        self.wait_for("document.querySelectorAll('#suggest .sug-item').length > 0")
+        self.cdp.eval("""(()=>{const i=document.querySelector('#kwInput');
+            i.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));})()""")
+        self.wait_for("localSubs().length === 1", timeout=8)
+        self.assertEqual(self.cdp.eval("localSubs()[0].keyword"), "君华雅筑")
+
+    def test_75_suggest_hides_on_escape_and_blur(self):
+        self.cdp.eval("go('sub')")
+        self.cdp.eval("""(()=>{const i=document.querySelector('#kwInput');
+            i.value='君华'; i.dispatchEvent(new Event('input',{bubbles:true}));})()""")
+        self.wait_for("document.querySelector('#suggest').style.display === 'block'")
+        self.cdp.eval("""(()=>{const i=document.querySelector('#kwInput');
+            i.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));})()""")
+        time.sleep(0.2)
+        self.assertEqual(self.cdp.eval("document.querySelector('#suggest').style.display"), "none")
+
+    def test_76_no_suggestion_for_gibberish(self):
+        """无匹配时应隐藏下拉，不能弹空框。"""
+        self.cdp.eval("go('sub')")
+        self.cdp.eval("""(()=>{const i=document.querySelector('#kwInput');
+            i.value='zzzzz不存在xx'; i.dispatchEvent(new Event('input',{bubbles:true}));})()""")
+        time.sleep(0.3)
+        self.assertEqual(self.cdp.eval("document.querySelector('#suggest').style.display"), "none")
 
     # ── 数据正确性 ────────────────────────────────────
 

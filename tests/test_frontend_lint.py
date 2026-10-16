@@ -120,7 +120,56 @@ def main():
             problems += fail("mergeSubs 缺少模式判断，静态托管下会把远端订阅"
                              "注入 localStorage，导致删除的订阅复活")
 
-    # 7) 测试钩子
+    # 7) 拼音表语法（曾因漏逗号把整份 JS 写崩，所有测试全红）
+    py = re.search(r"const PY = \{(.*?)\};", src, re.S)
+    if not py:
+        problems += fail("找不到 PY 拼音表")
+    else:
+        pairs = re.findall(r"'([^']+)'\s*:\s*'([^']+)'", py.group(1))
+        raw = py.group(1)
+        # 检查是否有粘连的两个 key（漏逗号的典型症状：'z''筑'）
+        sticky = re.search(r"'\)\s*'", raw)
+        # 统计引号数：每个键值对 4 个引号，总数必须是 4 的倍数
+        nq = raw.count("'")
+        if nq % 4 != 0:
+            problems += fail(f"拼音表引号数 {nq} 不是 4 的倍数 -> 疑似漏逗号/引号")
+        else:
+            problems += ok(f"拼音表语法正常（{len(pairs)} 个字）")
+        # 楼盘名高频字不能缺（缺了拼音搜索就搜不到）
+        must = "君华雅筑凤起潮鸣苑熠壹号道星湖雅"
+        missing = [c for c in must if f"'{c}'" not in raw]
+        if missing:
+            problems += fail(f"拼音表缺少楼盘名高频字: {missing}")
+        else:
+            problems += ok("拼音表覆盖楼盘名高频字")
+
+    # 8) 主页卡片必须有订阅星标按钮（用户反馈缺这个）
+    if 'class="star' in src:
+        problems += ok("卡片带订阅星标按钮")
+    else:
+        problems += fail("主页卡片没有订阅星标按钮（.star）")
+    if "toggleSubByProject" in src:
+        problems += ok("星标切换函数存在")
+    else:
+        problems += fail("缺少 toggleSubByProject()")
+    # 星标必须用捕获阶段，否则卡片内联 onclick 会先触发跳转
+    if re.search(r"\.addEventListener\('click'[\s\S]{0,200}?,\s*true\)", src):
+        problems += ok("星标使用捕获阶段拦截（防止误跳详情页）")
+    else:
+        problems += fail("星标未用捕获阶段，点星标会同时跳转详情页")
+
+    # 9) 搜索下拉候选（用户反馈缺这个）
+    for token, label in [("id=\"suggest\"", "下拉容器"),
+                         ("function renderSuggest", "候选渲染"),
+                         ("function matchProjects", "关键词匹配"),
+                         ("function pinyinInitials", "拼音首字母"),
+                         ("function suggestKey", "键盘操作")]:
+        if token in src:
+            problems += ok(f"{label}存在")
+        else:
+            problems += fail(f"缺少{label}（{token}）")
+
+    # 10) 测试钩子
     if "__errs" in src:
         problems += ok("存在 __errs 错误收集钩子")
     else:
