@@ -43,12 +43,15 @@ jobs:
 
       - name: 安装 Chromium（E2E 用）
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq chromium-browser || sudo apt-get install -y -qq chromium
-          (which chromium-browser || which chromium) > /tmp/chrome_path.txt
+          # Ubuntu 的 chromium-browser 是 snap 包装器，在 CI 里起不来（实测）。
+          # 用 Playwright 的 chromium 二进制（不依赖 snap，体积小、启动稳）。
+          pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+          python -c "from playwright.sync_api import sync_playwright as s; p=s().start(); print(p.chromium.executable_path); p.stop()" > /tmp/chrome_path.txt
           cat /tmp/chrome_path.txt
 
       - name: 端到端测试（真实浏览器点一遍：订阅增删 / 视图切换 / 排序）
+        timeout-minutes: 8
         run: |
           export CHROME_PATH="$(cat /tmp/chrome_path.txt)"
           echo "使用浏览器: $CHROME_PATH"

@@ -157,8 +157,10 @@ class DashboardE2E(unittest.TestCase):
 
         # 2) 起 headless Chromium
         cls.profile = tempfile.mkdtemp(prefix="e2e_chrome_")
+        # 部分 Chromium 构建（如 snap 版）不支持 --headless=new，用环境变量可切旧版
+        headless = os.environ.get("E2E_HEADLESS", "new")
         args = [
-            cls.chrome, "--headless=new", "--disable-gpu", "--no-first-run",
+            cls.chrome, f"--headless={headless}", "--disable-gpu", "--no-first-run",
             "--no-default-browser-check", "--disable-extensions",
             # Linux CI（root 用户 + 容器）必须关沙箱，否则进程直接退出，
             # 表现为读不到 DevToolsActivePort（CI 实战踩到）
