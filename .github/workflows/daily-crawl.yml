@@ -62,5 +62,10 @@ jobs:
             echo "数据无变化，跳过提交"
           else
             git commit -m "chore(data): 每日更新 $(date -u +%Y-%m-%d)"
-            git push
+            # 并发运行/上一次提交可能让 main 前进，先 rebase 再推，避免 non-fast-forward
+            for i in 1 2 3; do
+              git pull --rebase --autostash origin main && git push && break
+              echo "第 $i 次推送失败，重试..."
+              sleep 5
+            done
           fi
