@@ -46,25 +46,33 @@ class TestWorkflowGuard(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _seed(self, taken_at=None):
+    def _seed(self, taken_at=None, fetched=None, dtot=None):
         if os.path.exists(self.db):
             os.remove(self.db)
         if taken_at is None:
             return
         c = sqlite3.connect(self.db)
-        c.executescript("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, taken_at TEXT);")
-        c.execute("INSERT INTO snapshots(taken_at) VALUES (?)", (taken_at,))
+        c.executescript(
+            "CREATE TABLE snapshots(id INTEGER PRIMARY KEY, taken_at TEXT,"
+            " fetched INTEGER, dtot INTEGER);")
+        c.execute("INSERT INTO snapshots(taken_at, fetched, dtot) VALUES (?,?,?)",
+                  (taken_at, fetched, dtot))
         c.commit()
         c.close()
 
-    def _run(self):
+    def _run(self, force=False):
         """模拟 workflow：脚本 stdout 追加到 $GITHUB_OUTPUT，返回 (rc, 输出, stderr)。"""
         outfile = os.path.join(self.tmp, "out.txt")
         open(outfile, "w").close()
+        env = dict(os.environ)
+        if force:
+            env["FORCE"] = "true"
+        else:
+            env.pop("FORCE", None)
         with open(outfile, "a", encoding="utf-8") as fh:
             r = subprocess.run([sys.executable, "-c", self.script],
                                cwd=self.tmp, stdout=fh,
-                               stderr=subprocess.PIPE, text=True)
+                               stderr=subprocess.PIPE, text=True, env=env)
         with open(outfile, encoding="utf-8") as fh:
             out = fh.read().strip()
         return r.returncode, out, r.stderr
@@ -73,14 +81,14 @@ class TestWorkflowGuard(unittest.TestCase):
 
     def test_skip_when_already_crawled_today(self):
         today = datetime.now(timezone.utc).astimezone(TZ8).strftime("%Y-%m-%d")
-        self._seed(f"{today} 09:07:00")
+        self._seed(f"{today} 09:07:00", fetched=455, dtot=455)
         rc, out, _ = self._run()
         self.assertEqual(rc, 0)
-        self.assertIn("done=true", out, "今天已抓过应跳过，避免重复快照")
+        self.assertIn("done=true", out, "今天已完整抓过应跳过，避免重复快照")
 
     def test_run_when_last_crawl_was_yesterday(self):
         y = (datetime.now(timezone.utc).astimezone(TZ8) - timedelta(days=1)).strftime("%Y-%m-%d")
-        self._seed(f"{y} 09:07:00")
+        self._seed(f"{y} 09:07:00", fetched=455, dtot=455)
         rc, out, _ = self._run()
         self.assertIn("done=false", out, "昨天抓的，今天应继续抓")
 
@@ -102,9 +110,36 @@ class TestWorkflowGuard(unittest.TestCase):
     def test_midnight_boundary_yesterday_2359_is_not_today(self):
         """跨日边界：昨天 23:59 不能被当成今天。"""
         y = (datetime.now(timezone.utc).astimezone(TZ8) - timedelta(days=1)).strftime("%Y-%m-%d")
-        self._seed(f"{y} 23:59:59")
+        self._seed(f"{y} 23:59:59", fetched=455, dtot=455)
         rc, out, _ = self._run()
         self.assertIn("done=false", out)
+
+    def test_incomplete_same_day_crawl_must_rerun(self):
+        """当天抓过但没抓全（fetched < dtot）必须重抓。
+
+        真实风险：09:07 那档抓一半崩了仍写快照，若守卫只看日期，
+        09:27/10:07/10:37 三档全部跳过 -> 当天数据永久缺页且不自愈。
+        """
+        today = datetime.now(timezone.utc).astimezone(TZ8).strftime("%Y-%m-%d")
+        self._seed(f"{today} 09:07:00", fetched=120, dtot=455)
+        rc, out, err = self._run()
+        self.assertIn("done=false", out, "抓一半也必须重抓")
+        self.assertIn("完整=False", err)
+
+    def test_zero_dtot_must_rerun(self):
+        """dtot=0（站点没报总数）不能当成已抓完。"""
+        today = datetime.now(timezone.utc).astimezone(TZ8).strftime("%Y-%m-%d")
+        self._seed(f"{today} 09:07:00", fetched=0, dtot=0)
+        rc, out, _ = self._run()
+        self.assertIn("done=false", out)
+
+    def test_force_bypasses_guard(self):
+        """手动触发带 force=true 时必须强制重抓。"""
+        today = datetime.now(timezone.utc).astimezone(TZ8).strftime("%Y-%m-%d")
+        self._seed(f"{today} 09:07:00", fetched=455, dtot=455)
+        rc, out, err = self._run(force=True)
+        self.assertIn("done=false", out, "force 应绕过「今天已抓」守卫")
+        self.assertIn("force=True", err)
 
     def test_empty_snapshots_table(self):
         c = sqlite3.connect(self.db)
@@ -112,6 +147,80 @@ class TestWorkflowGuard(unittest.TestCase):
         c.commit(); c.close()
         rc, out, _ = self._run()
         self.assertIn("done=false", out, "表存在但无数据应继续抓")
+
+
+def extract_push_retry_block():
+    """抽出 workflow 里「commit 后 push 重试」那段 bash。"""
+    src = open(WF, encoding="utf-8").read()
+    m = re.search(r"(?m)^(\s+)ok=0\n((?:\1.*\n)*?\1\[ \"\$ok\" = 1 \].*\n)", src)
+    if not m:
+        raise RuntimeError("workflow 里找不到 push 重试块（结构被改动？）")
+    indent = m.group(1)
+    block = "ok=0\n" + m.group(2)
+    return "\n".join(l[len(indent):] if l.startswith(indent) else l
+                     for l in block.splitlines())
+
+
+class TestPushRetryBehavior(unittest.TestCase):
+    """真跑重试脚本（桩 git），而不是在 YAML 里搜字符串。
+
+    字符串断言挡不住「把 ok=1 写在循环外」「exit 1 在永远到不了的分支里」这类
+    假修复；只有执行一遍看退出码和 git 调用次数才作数。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pushretry_")
+        self.block = extract_push_retry_block()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, fail_on=""):
+        """用 bash 函数桩掉 git/sleep，再把 workflow 原文喂给 bash -s 执行。
+
+        注意别用 `bash -c <script>`：本机 bash 解析到 WSL 的 /bin/bash，
+        `-c` 传参时脚本里的 $VAR 会诡异地展开成空（实测），换 stdin 才稳定。
+        """
+        script = ("git(){ echo \"$@\" >> calls.txt; "
+                  "case \"$*\" in *\"%s\"*) [ -n \"%s\" ] && return 1;; esac; "
+                  "return 0; }\n"
+                  "sleep(){ :; }\n" % (fail_on, fail_on)) + self.block + "\n"
+        r = subprocess.run(["bash", "-e", "-s"], input=script.encode("utf-8"),
+                           capture_output=True, cwd=self.tmp, timeout=120)
+        calls = []
+        path = os.path.join(self.tmp, "calls.txt")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                calls = [l for l in f.read().splitlines() if l.strip()]
+        return r, calls
+
+    @staticmethod
+    def _out(r):
+        return (r.stdout or b"").decode("utf-8", "replace") + \
+               (r.stderr or b"").decode("utf-8", "replace")
+
+    def test_push_all_ok_exits_zero(self):
+        if not shutil.which("bash"):
+            self.skipTest("没有 bash")
+        r, calls = self._run()
+        self.assertEqual(r.returncode, 0, self._out(r))
+        self.assertEqual(len(calls), 2, f"应恰好 pull+push 各一次，实际 {calls}")
+
+    def test_pull_fails_three_times_exits_nonzero(self):
+        if not shutil.which("bash"):
+            self.skipTest("没有 bash")
+        r, calls = self._run(fail_on="pull")
+        self.assertEqual(r.returncode, 1, "3 次失败后必须非零退出，否则数据没上传却显示绿色")
+        self.assertIn("连续 3 次推送失败", self._out(r))
+        self.assertEqual(len(calls), 3, f"应恰好重试 3 轮，实际 {calls}")
+
+    def test_push_fails_but_pull_ok_retries_three_times(self):
+        if not shutil.which("bash"):
+            self.skipTest("没有 bash")
+        r, calls = self._run(fail_on="push")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(sum(1 for c in calls if c.startswith("pull")), 3)
+        self.assertEqual(sum(1 for c in calls if c.startswith("push")), 3)
 
 
 class TestWorkflowConfig(unittest.TestCase):

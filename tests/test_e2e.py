@@ -17,6 +17,7 @@
 import base64
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -24,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
@@ -139,8 +141,13 @@ class CDPClient:
             pass
 
 
-class DashboardE2E(unittest.TestCase):
-    """静态托管场景（GitHub Pages 同构）：web/ 目录 + data.json，无后端。"""
+class BrowserBase(unittest.TestCase):
+    """只负责起 headless Chromium + CDP 连接；页面从哪来由子类决定。
+
+    拆出基类的目的：静态托管（Pages）和本地 serve.py 两种模式要各跑一遍，
+    之前把浏览器生命周期写在 DashboardE2E 里，想复用就只能继承它 —— 那样
+    会连它的用例一起继承（父类的静态模式断言在 api 模式下必然失败）。
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -148,14 +155,7 @@ class DashboardE2E(unittest.TestCase):
         if not cls.chrome:
             raise unittest.SkipTest("未找到 Chromium，跳过 E2E")
 
-        # 1) 起静态服务器（模拟 Pages）
-        os.chdir(WEB)
-        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
-        cls.port = cls.httpd.server_address[1]
-        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
-        cls.base = f"http://127.0.0.1:{cls.port}"
-
-        # 2) 起 headless Chromium
+        # 起 headless Chromium
         cls.profile = tempfile.mkdtemp(prefix="e2e_chrome_")
         # 部分 Chromium 构建（如 snap 版）不支持 --headless=new，用环境变量可切旧版
         headless = os.environ.get("E2E_HEADLESS", "new")
@@ -203,7 +203,7 @@ class DashboardE2E(unittest.TestCase):
                 f"Chromium 未启动（binary={cls.chrome}, rc={cls.proc.poll()}）\n"
                 f"--- chrome 日志 ---\n{log}")
 
-        # 3) 拿页面 target
+        # 拿页面 target
         with urllib.request.urlopen(
                 f"http://127.0.0.1:{cls.cdp_port}/json", timeout=10) as r:
             targets = json.load(r)
@@ -227,7 +227,6 @@ class DashboardE2E(unittest.TestCase):
             cls.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             cls.proc.kill()
-        cls.httpd.shutdown()
 
     def setUp(self):
         self.cdp.eval("try{localStorage.clear()}catch(e){}")
@@ -237,14 +236,18 @@ class DashboardE2E(unittest.TestCase):
         self.wait_for("Array.isArray(PRO) && PRO.length > 0", timeout=15)
 
     def visible(self, sel):
-        """元素是否真的可见。必须用 computed style：
-        内联 style.display 为空时，可能是 CSS 在隐藏（.detail{display:none}），
-        只看内联会误判为"可见"（踩过）。"""
+        """元素是否真的可见 —— 三重判定，任一不满足都算不可见。
+
+        坑（弱断言）：只看元素自身的 computed style 会漏掉两种情况：
+        ① 元素被 display:none 的祖先包着（自身 display 仍是 block）；
+        ② 选择器根本没匹配到元素（返回 False，会让 assertFalse 假通过）。
+        所以这里元素不存在直接抛错，可见性用 getClientRects() 判真实占位。"""
         return self.cdp.eval(
-            f"(()=>{{const e=document.querySelector('{sel}');"
-            f"if(!e) return false;"
-            f"const s=getComputedStyle(e);"
-            f"return s.display!=='none' && s.visibility!=='hidden';}})()")
+            f"""(()=>{{const e=document.querySelector('{sel}');
+            if(!e) throw new Error('visible(): 元素不存在 {sel}');
+            const s=getComputedStyle(e);
+            if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false;
+            return e.getClientRects().length>0;}})()""")
 
     def wait_for(self, expr, timeout=12):
         deadline = time.time() + timeout
@@ -258,6 +261,24 @@ class DashboardE2E(unittest.TestCase):
                 last = e
             time.sleep(0.15)
         raise AssertionError(f"等待超时: {expr!r} (最后值={last!r})")
+
+
+class DashboardE2E(BrowserBase):
+    """静态托管场景（GitHub Pages 同构）：web/ 目录 + data.json，无后端。"""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        os.chdir(WEB)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        super().tearDownClass()
 
     # ── 页面基础 ──────────────────────────────────────
 
@@ -278,6 +299,29 @@ class DashboardE2E(unittest.TestCase):
     def test_04_no_js_errors_on_load(self):
         errs = self.cdp.eval("(window.__errs||[]).length")
         self.assertEqual(errs, 0)
+
+    def test_05_card_render_escapes_gov_fields(self):
+        """楼盘名/公司名来自政务站，必须转义。
+
+        只检查源码里出现 esc() 是弱断言（套错位置也会过）；这里直接往 PRO 塞一段
+        带 onerror 的 HTML，跑真实渲染，然后看 DOM 里有没有冒出新元素、有没有执行。
+        """
+        self.cdp.eval("""(()=>{window.__p0=PRO.slice();
+          PRO.push({project:'<img src=x onerror="window.__xss1=1">恶意盘',
+            display:'<script>window.__xss2=1</script>',
+            company:'<img src=x onerror="window.__xss3=1">皮包公司',
+            alive:1,sold:0,total:1,sell_rate:0,avg_price:1,avg_area:1});renderList();})()""")
+        time.sleep(0.4)
+        self.assertEqual(
+            self.cdp.eval("document.querySelectorAll('#projects img, #projects script').length"), 0,
+            "卡片里冒出了 img/script 元素 —— esc() 没覆盖到该字段")
+        txt = self.cdp.eval("document.querySelector('#projects').textContent")
+        self.assertIn("恶意盘", txt)
+        self.assertIn("<img", txt, "被转义后应作为纯文本出现，而不是变成元素")
+        for v in ("__xss1", "__xss2", "__xss3"):
+            self.assertEqual(self.cdp.eval(f"typeof window.{v}"), "undefined",
+                             f"{v} 被执行了 —— 存在 XSS 注入面")
+        self.cdp.eval("PRO=window.__p0;renderList()")
 
     # ── 排序 tabs ──────────────────────────────────────
 
@@ -343,6 +387,33 @@ class DashboardE2E(unittest.TestCase):
         else:
             self.assertIn("数据点不足", txt)
 
+    def test_22_detail_render_escapes_gov_fields(self):
+        """详情页的坐落/面积来自政务站，必须转义（存储型 XSS 面）。
+
+        同样不看源码、看真实渲染：塞一条带 onerror 的房源进 project_details，
+        打开详情页，断言 DOM 里没有新增 img/script、也没有脚本被执行。
+        """
+        self.cdp.eval("""(()=>{CACHE.project_details=CACHE.project_details||{};
+          CACHE.project_details['__xss__']={
+            project:'__xss__', display:'', company:'<img src=x onerror="window.__xssc=1">',
+            alive:1, sold_total:0, listed_total:1, sell_rate:0,
+            avg_price:1, min_price:1, max_price:1, avg_area:1,
+            sold_7d:0, sold_30d:0, new_7d:0, new_30d:0,
+            sold_rate_7d:0, sold_rate_30d:0, amount_30d_wan:0, days_to_clear:null,
+            snapshots:[],
+            alive_list:[{location:'<img src=x onerror="window.__xssl=1">',
+                         area:'<img src=x onerror="window.__xssa=1">', price:1, layout:'x'}],
+            recent_sold:[]};})()""")
+        self.cdp.eval("openDetail('__xss__')")
+        self.wait_for("document.querySelector('#detailView').style.display === 'block'")
+        time.sleep(0.4)
+        self.assertEqual(
+            self.cdp.eval("document.querySelectorAll('#detailView img, #detailView script').length"),
+            0, "详情页里冒出了 img/script 元素 —— 有字段没过 esc()")
+        for v in ("__xssc", "__xssl", "__xssa"):
+            self.assertEqual(self.cdp.eval(f"typeof window.{v}"), "undefined",
+                             f"{v} 被执行了 —— 详情页存在 XSS 注入面")
+
     # ── 订阅：增删改查（之前的 bug 重灾区）────────────────
 
     def test_30_subscribe_adds_local_chip(self):
@@ -354,15 +425,34 @@ class DashboardE2E(unittest.TestCase):
         self.assertEqual(self.cdp.eval("localSubs()[0].keyword"), "凤起潮鸣苑")
 
     def test_31_delete_button_removes_chip(self):
-        """核心回归：删除按钮必须真的能删（曾因 id 未加引号变成变量名而静默失效）。"""
+        """核心回归：删除按钮必须真的能删（曾因 id 未加引号变成变量名而静默失效）。
+
+        加强点：光看「chip 消失」不够 —— 只重渲染内存、没写回 localStorage 也会绿。
+        这里同时断言 ① chip 文案是刚订阅的关键词 ② localStorage 真被清空
+        ③ 刷新页面后不复活。"""
         self.cdp.eval("go('sub')")
         self.cdp.eval("document.querySelector('#kwInput').value='测试盘'")
         self.cdp.eval("document.querySelector('.sub-input button').click()")
         self.wait_for("document.querySelectorAll('#subs .chip').length === 1")
+        self.assertIn("测试盘", self.cdp.eval("document.querySelector('#subs .chip').innerText"),
+                      "删除前 chip 应显示订阅关键词")
+        sid = self.cdp.eval("String((localSubs()[0]||{}).id||'')")
+        self.assertTrue(sid, "订阅项必须有 id，否则删除按钮无从定位")
         # 点 ×
         self.cdp.eval("document.querySelector('#subs .chip button').click()")
         self.wait_for("document.querySelectorAll('#subs .chip').length === 0", timeout=8)
         self.assertEqual(self.cdp.eval("localSubs().length"), 0)
+        self.assertEqual(self.cdp.eval(
+            "JSON.parse(localStorage.getItem('sz_subs_v1')||'[]').length"), 0,
+            "删除必须写回 localStorage，不能只改内存里的 SUBS")
+        # 刷新后不能复活
+        self.cdp.call("Page.navigate", url=self.base + "/index.html")
+        self.wait_for("typeof window.go === 'function'")
+        self.wait_for("Array.isArray(PRO) && PRO.length > 0", timeout=15)
+        self.assertEqual(self.cdp.eval("localSubs().length"), 0, "刷新后被删的订阅不能复活")
+        self.cdp.eval("go('sub')")
+        time.sleep(0.2)
+        self.assertEqual(self.cdp.eval("document.querySelectorAll('#subs .chip').length"), 0)
 
     def test_32_subscribe_is_idempotent(self):
         self.cdp.eval("go('sub')")
@@ -434,17 +524,38 @@ class DashboardE2E(unittest.TestCase):
         self.assertEqual(self.cdp.eval("document.querySelector('#projects .star').innerText"), "☆")
 
     def test_61_card_star_toggles_subscription(self):
-        """点星标要能订阅/取消，且不能触发卡片跳详情页。"""
+        """点星标要能订阅/取消，且不能触发卡片跳详情页。
+
+        加强点：① 断言订阅的是「被点的那张卡」而不是别的项目；
+        ② 详情页不仅 display:none，还不允许有任何内容（被渲染过就算 bug）；
+        ③ 取消订阅后星标回 ☆，且列表卡片数不变（不能因为重渲染丢卡）。"""
+        n_cards = self.cdp.eval("document.querySelectorAll('#projects .card').length")
+        key = self.cdp.eval(
+            "document.querySelector('#projects .star').closest('.card').dataset.p")
+        self.assertTrue(key, "卡片必须有 data-p，否则无法确认订阅的是哪个项目")
         self.cdp.eval("document.querySelector('#projects .star').click()")
         self.wait_for("localSubs().length === 1")
+        self.assertEqual(self.cdp.eval("localSubs()[0].keyword"), key,
+                         "星标必须订阅它所在的那张卡片")
         # 关键：不应跳到详情页（事件冒泡没阻止的话会跳）
         self.assertFalse(self.visible("#detailView"), "点星标不应触发卡片跳转详情页")
         self.assertEqual(self.cdp.eval("view"), "list", "点星标后视图应仍在列表")
+        self.assertEqual(self.cdp.eval("document.querySelector('#detailView').innerText"), "",
+                         "详情页根本没被渲染，innerText 必须是空的")
+        # 订阅后置顶的是同一个项目，星标实心
+        self.assertEqual(self.cdp.eval("document.querySelector('#projects .card').dataset.p"), key,
+                         "订阅的项目应置顶")
+        self.assertEqual(
+            self.cdp.eval("document.querySelector('#projects .star').dataset.sub"), key,
+            "置顶卡片的星标应属于同一个项目")
         self.assertEqual(self.cdp.eval("document.querySelector('#projects .star').innerText"), "★")
+        self.assertEqual(self.cdp.eval("document.querySelectorAll('#projects .card').length"),
+                         n_cards, "重渲染后不能丢卡片")
         # 再点一次取消
         self.cdp.eval("document.querySelector('#projects .star').click()")
         self.wait_for("localSubs().length === 0")
         self.assertEqual(self.cdp.eval("document.querySelector('#projects .star').innerText"), "☆")
+        self.assertFalse(self.visible("#detailView"), "取消订阅也不应跳详情页")
 
     # ── 搜索下拉候选（用户反馈缺这个）──────────────────
 
@@ -540,6 +651,136 @@ class DashboardE2E(unittest.TestCase):
         self.wait_for("typeof window.go === 'function'")
         self.wait_for("Array.isArray(SUBS) && SUBS.length > 0", timeout=15)
         self.assertEqual(self.cdp.eval("localSubs()[0].keyword"), "持久化盘")
+
+
+class ApiModeE2E(BrowserBase):
+    """本地 serve.py 模式（MODE='api'）：真后端 + 真浏览器。
+
+    为什么单独补：其余 E2E 全跑静态托管，serve.py 的 /api/* 只有单测直连，
+    没有任何测试验证「前端在 api 模式下能渲染、订阅能落库且删除能打到服务端」。
+    数据库用临时副本，绝不改真实 data/housing.db。
+
+    只继承 BrowserBase（浏览器生命周期），不继承 DashboardE2E 的用例 ——
+    静态模式的断言（localStorage 为空、MODE=static）在 api 模式下必然失败。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()            # headless Chromium + CDP
+        src_db = os.path.join(ROOT, "data", "housing.db")
+        if not os.path.exists(src_db):
+            raise unittest.SkipTest("没有 data/housing.db，跳过 api 模式 E2E")
+        cls.api_tmp = tempfile.mkdtemp(prefix="e2e_api_")
+        cls.api_db = os.path.join(cls.api_tmp, "housing.db")
+        shutil.copyfile(src_db, cls.api_db)
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        cls.api_port = s.getsockname()[1]
+        s.close()
+        cls.api_base = f"http://127.0.0.1:{cls.api_port}"
+        cls.api_log = os.path.join(cls.api_tmp, "serve.log")
+        cls._api_fh = open(cls.api_log, "wb")
+        cls.api_proc = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "scripts", "serve.py"),
+             "--db", cls.api_db, "--host", "127.0.0.1", "--port", str(cls.api_port)],
+            stdout=cls._api_fh, stderr=cls._api_fh)
+        for _ in range(120):
+            try:
+                with urllib.request.urlopen(cls.api_base + "/api/stats", timeout=2) as r:
+                    json.load(r)
+                break
+            except Exception:
+                if cls.api_proc.poll() is not None:
+                    break
+                time.sleep(0.25)
+        else:
+            # 超时：进程可能半死不活，先收尸再抛错（tearDownClass 这时不会被调用）
+            cls.api_proc.kill()
+            cls.api_proc.wait(timeout=10)
+            cls._api_fh.close()
+        if cls.api_proc.poll() is not None:
+            raise RuntimeError("serve.py 起不来（见 %s）" % cls.api_log)
+        cls.base = cls.api_base        # 父类 setUp 据此导航到后端页面
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.api_proc.terminate()
+            cls.api_proc.wait(timeout=10)
+        except Exception:
+            try:
+                cls.api_proc.kill()
+            except Exception:
+                pass
+        try:
+            cls._api_fh.close()
+        except Exception:
+            pass
+        shutil.rmtree(cls.api_tmp, ignore_errors=True)
+        super().tearDownClass()
+
+    def _api_json(self, path):
+        with urllib.request.urlopen(self.api_base + path, timeout=10) as r:
+            return json.load(r)
+
+    def test_a1_api_mode_renders(self):
+        self.assertEqual(self.cdp.eval("MODE"), "api", "有后端时必须走 api 模式")
+        self.assertGreater(self.cdp.eval("PRO.length"), 10)
+        self.assertEqual(self.cdp.eval("(window.__errs||[]).length"), 0)
+        self.assertEqual(self.cdp.eval("document.querySelectorAll('#projects .card').length"),
+                         self.cdp.eval("PRO.length"))
+
+    def test_a2_detail_matches_api_payload(self):
+        """详情页的套数/在售行/曲线点数必须与 /api/project 返回一致。"""
+        key = self.cdp.eval("document.querySelector('#projects .card').dataset.p")
+        d = self._api_json("/api/project?name=" + urllib.parse.quote(key) + "&days=30")
+        self.cdp.eval("document.querySelector('#projects .card').click()")
+        self.wait_for("document.querySelector('#detailView').style.display === 'block'")
+        txt = self.cdp.eval("document.querySelector('#detailView').innerText")
+        self.assertIn(f"{d['alive']} 套", txt)
+        rows = self.cdp.eval("document.querySelectorAll('#detailView table')[0].rows.length")
+        self.assertEqual(rows, len(d["alive_list"]) + 1, "在售表行数应等于 API 返回条数+表头")
+        self.assertEqual(len(d["alive_list"]), min(d["alive"], 50))
+        self.assertEqual(len(d["recent_sold"]), min(d["sold_total"], 10))
+        if len(d["snapshots"]) >= 2:
+            npts = self.cdp.eval(
+                "(()=>{const p=document.querySelector('#detailView .spark polyline');"
+                "return p?p.getAttribute('points').trim().split(/\\s+/).length:0})()")
+            self.assertEqual(npts, len(d["snapshots"]))
+
+    def test_a3_subscribe_and_delete_roundtrip_server(self):
+        """api 模式：订阅落库；删除必须打到服务端，刷新不能复活。"""
+        kw = "验收测试盘"
+        kwjs = json.dumps(kw, ensure_ascii=False)
+        self.cdp.eval("go('sub')")
+        self.cdp.eval(f"document.querySelector('#kwInput').value={kwjs}")
+        self.cdp.eval("document.querySelector('.sub-input button').click()")
+        self.wait_for(f"localSubs().some(s=>s.keyword==={kwjs})")
+        # 等服务端 id 回填（改成 'r'+id），否则删除打不到服务端
+        self.wait_for(
+            "String((localSubs().find(s=>s.keyword===" + kwjs + ")||{}).id||'').startsWith('r')",
+            timeout=10)
+        self.assertIn(kw, [s["keyword"] for s in self._api_json("/api/subscriptions")],
+                      "订阅必须落库到服务端")
+        # 精确点这一条的 ×（列表里可能还有别的订阅）
+        self.cdp.eval(
+            f"[...document.querySelectorAll('#subs .chip')].find(c=>c.innerText.includes({kwjs}))"
+            ".querySelector('button').click()")
+        self.wait_for(f"!localSubs().some(s=>s.keyword==={kwjs})")
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if kw not in [s["keyword"] for s in self._api_json("/api/subscriptions")]:
+                break
+            time.sleep(0.2)
+        self.assertNotIn(kw, [s["keyword"] for s in self._api_json("/api/subscriptions")],
+                         "删除没打到服务端 —— 刷新后被删的订阅会复活")
+        # 刷新验证不复活
+        self.cdp.call("Page.navigate", url=self.base + "/index.html")
+        self.wait_for("typeof window.go === 'function'")
+        self.wait_for("Array.isArray(PRO) && PRO.length > 0", timeout=15)
+        self.assertFalse(self.cdp.eval(f"localSubs().some(s=>s.keyword==={kwjs})"),
+                         "刷新后被删的订阅复活了")
 
 
 if __name__ == "__main__":

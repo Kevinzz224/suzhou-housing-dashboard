@@ -273,7 +273,7 @@ function renderList(){
   });
 }
 
-function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 
 async function openDetail(name){
   const d=await J('/api/project?name='+encodeURIComponent(name)+'&days=30');
@@ -320,13 +320,13 @@ async function openDetail(name){
     <div class="sec">
       <h3>在售房源 <em>${d.alive} 套 · 按单价降序</em></h3>
       <table><tr><th>坐落</th><th class="r">面积</th><th class="r">单价</th></tr>
-      ${d.alive_list.map(r=>`<tr><td>${esc(r.location)}</td><td class="r">${r.area}</td><td class="r">${fmt(r.price)}</td></tr>`).join('')}
+      ${d.alive_list.map(r=>`<tr><td>${esc(r.location)}</td><td class="r">${esc(r.area)}</td><td class="r">${fmt(r.price)}</td></tr>`).join('')}
       </table>
     </div>
     <div class="sec">
       <h3>最近成交 <em>${d.sold_total} 套</em></h3>
       <table><tr><th>坐落</th><th class="r">面积</th><th class="r">单价</th><th class="r">日期</th></tr>
-      ${d.recent_sold.length?d.recent_sold.map(r=>`<tr><td>${esc(r.location)}</td><td class="r">${r.area}</td><td class="r">${fmt(r.price)}</td><td class="r">${r.sold_at}</td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--mut);text-align:center;padding:16px">还没有检出成交，多跑几天就有啦</td></tr>'}
+      ${d.recent_sold.length?d.recent_sold.map(r=>`<tr><td>${esc(r.location)}</td><td class="r">${esc(r.area)}</td><td class="r">${fmt(r.price)}</td><td class="r">${esc(r.sold_at)}</td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--mut);text-align:center;padding:16px">还没有检出成交，多跑几天就有啦</td></tr>'}
       </table>
     </div>`;
   window.scrollTo(0,0);
@@ -520,8 +520,19 @@ async function addSub(){
   $('#kwInput').value='';
   toast('已订阅 '+kw+' ★（存在本机）');
   if(MODE==='api'){
-    try{ await fetch('/api/subscriptions',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({keyword:kw})}); }catch(e){}
+    try{
+      const r=await fetch('/api/subscriptions',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({keyword:kw})});
+      const j=await r.json();
+      // 拿到服务端 id 后改成本地记录的 id（'r'+id）：delSub 靠这个前缀才知道
+      // 该不该打 /api/subscriptions/delete。否则本地删了、服务端还 active=1，
+      // 下次加载 mergeSubs 会把订阅又合并回来（api 模式下删除形同虚设）。
+      if(j && j.id){
+        const cur=localSubs(); const hit=cur.find(s=>s.keyword===kw);
+        // 必须重渲染：chip 上的 data-del 是渲染时写入的旧 id，不刷新就还是 'L...'
+        if(hit){ hit.id='r'+j.id; saveLocalSubs(cur); SUBS=cur; renderSubs(); }
+      }
+    }catch(e){}
   }
 }
 async function delSub(id){

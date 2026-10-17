@@ -8,6 +8,7 @@
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -26,6 +27,7 @@ sys.path.insert(0, SCRIPTS)
 
 import serve                      # noqa: E402
 import webforms_crawl as wf       # noqa: E402
+import export_static              # noqa: E402  导出产物也是被测对象
 
 
 # ───────────────────────── 测试夹具 ─────────────────────────
@@ -178,6 +180,20 @@ class TestNowCn(unittest.TestCase):
         self.assertLess(abs((got - want).total_seconds()), 5)
 
 
+class TestParseDays(unittest.TestCase):
+    """days 参数解析：非法值必须抛 ValueError（HTTP 层转 400，不能 500）。"""
+
+    def test_defaults(self):
+        self.assertEqual(serve.parse_days(None), 30)
+        self.assertEqual(serve.parse_days(""), 30)
+        self.assertEqual(serve.parse_days("7"), 7)
+
+    def test_rejects_non_positive_and_non_numeric(self):
+        for v in ("0", "-1", "-999", "abc", "1.5", "30d", " "):
+            with self.assertRaises(ValueError, msg=f"days={v!r} 应被拒绝"):
+                serve.parse_days(v)
+
+
 # ───────────────────────── 2. 项目名与别名 ─────────────────────────
 
 class TestProjectOf(unittest.TestCase):
@@ -309,6 +325,21 @@ class TestDbLayer(unittest.TestCase):
         # price 在 schema 里是 REAL 列，SQLite 会把 '99999' 存成 99999.0，
         # 所以按数值比较（曾误写成字符串比较导致假失败）。
         self.assertAlmostEqual(float(got), 99999.0)
+
+    def test_upsert_keeps_first_seen_at(self):
+        """first_seen_at 是「该房源首次出现在可售列表」的时间，重抓绝不能刷新它。
+
+        存量曲线完全靠这个字段反推（first_seen_at <= T 才算当时在售），
+        一旦被 last_seen_at 覆盖，历史点会集体右移。"""
+        wf.db_upsert(self.conn, "test", self._rows(1), self.site)
+        self.conn.execute(
+            "UPDATE listings SET first_seen_at='2020-01-01 00:00:00' WHERE key_id='K0'")
+        self.conn.commit()
+        wf.db_upsert(self.conn, "test", self._rows(1), self.site)
+        row = self.conn.execute(
+            "SELECT first_seen_at, last_seen_at FROM listings WHERE key_id='K0'").fetchone()
+        self.assertEqual(row[0], "2020-01-01 00:00:00")
+        self.assertGreater(row[1], wf.now_cn()[:10] + " 00:00:00", "last_seen_at 应刷新")
 
     def test_upsert_skips_rows_without_key(self):
         rows = [{"key_id": "", "location": "x"}, {"key_id": None, "location": "y"}]
@@ -442,6 +473,92 @@ class TestProjectSnapshots(unittest.TestCase):
 
     def test_unknown_project_returns_empty(self):
         self.assertEqual(serve.project_snapshots(self.conn, "不存在", days=3650), [])
+
+    def test_appends_now_point_when_changed_after_last_snapshot(self):
+        """成交发生在最后一次快照之后（抓取中途崩溃）时，必须补「现在」点。
+
+        否则曲线末点会高于真实在售数，且一直错到下一次抓取。
+        """
+        # 只有 10:00 一个快照；随后 A2 在 11:00 售出，但没有 11:00 的快照
+        c = sqlite3.connect(self.db)
+        c.execute("DELETE FROM snapshots")
+        c.execute("INSERT INTO snapshots(site,taken_at,query,total,new,changed,sold,alive)"
+                  " VALUES ('s','2026-10-17 10:00:00','{}',0,0,0,0,0)")
+        c.execute("UPDATE listings SET sold_at='2026-10-17 11:00:00' WHERE key_id='A2'")
+        c.commit()
+        c.close()
+        snaps = serve.project_snapshots(self.conn, "甲苑", days=3650)
+        self.assertEqual(snaps[-1]["time"], "现在",
+                         "快照后有变化时应追加「现在」点")
+        self.assertEqual(snaps[-1]["alive"], 2,
+                         "现在点应反映真实在售（A1 + A3）")
+        d = serve.api_project(self.conn, "甲苑", days=3650)
+        self.assertEqual(d["snapshots"][-1]["alive"], d["alive"],
+                         "补点后末点必须等于当前在售")
+
+
+class TestProjectSnapshotsBoundaries(unittest.TestCase):
+    """存量曲线的边界口径：同一秒、跨日窗口、复活后的历史点。
+
+    这三处原来没有任何测试 —— 而它们正是「末点 ≠ 当前在售数」的高发地带。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="psb_")
+        self.conn = wf.init_db(os.path.join(self.tmp, "t.db"))
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _snap(self, t):
+        self.conn.execute(
+            "INSERT INTO snapshots (site,taken_at,query,total,new,changed,sold,alive)"
+            " VALUES ('s',?,'{}',0,0,0,0,0)", (t,))
+        self.conn.commit()
+
+    def _listing(self, key, loc, first_seen, sold_at=None):
+        self.conn.execute(
+            "INSERT INTO listings (site,key_id,first_seen_at,last_seen_at,location,sold_at)"
+            " VALUES ('s',?,?,?,?,?)", (key, first_seen, first_seen, loc, sold_at))
+        self.conn.commit()
+
+    def test_sold_at_same_second_as_snapshot_is_not_alive(self):
+        """sold_at == taken_at：同一秒按「已售」算。
+
+        口径必须固定，否则末点会在 1/0 之间抖（mark_sold 与快照时间戳都是
+        now_cn()，秒级相同完全可能）。"""
+        t = "2026-10-17 10:00:00"
+        self._snap(t)
+        self._listing("A", "甲苑1幢101", "2026-10-16 09:00:00")
+        self._listing("B", "甲苑1幢102", "2026-10-16 09:00:00", sold_at=t)
+        self.assertEqual([s["alive"] for s in serve.project_snapshots(self.conn, "甲苑", days=3650)],
+                         [1])
+        d = serve.api_project(self.conn, "甲苑", days=3650)
+        self.assertEqual(d["alive"], 1)
+        self.assertEqual(d["snapshots"][-1]["alive"], d["alive"],
+                         "同一秒售出也不能让末点偏离当前在售数")
+
+    def test_days_window_is_inclusive_of_cutoff_date(self):
+        """days=1 时跨日两点都要保留（16 日 23:59 与 17 日 00:01 属同一窗口）。"""
+        self._snap("2026-10-15 10:00:00")     # 窗口外
+        self._snap("2026-10-16 23:59:00")
+        self._snap("2026-10-17 00:01:00")
+        self._listing("A", "甲苑1幢101", "2026-10-14 09:00:00")
+        with mock.patch.object(serve, "now_cn", return_value=datetime(2026, 10, 17, 12, 0, 0)):
+            snaps = serve.project_snapshots(self.conn, "甲苑", days=1)
+        self.assertEqual([s["time"] for s in snaps], ["23:59", "00:01"])
+
+    def test_revival_is_retroactive_known_tradeoff(self):
+        """已知取舍：售出后再上架（sold_at 被清空）无法回放中间那段空窗。
+
+        listings 只存最终状态，没有 available 区间表，所以历史点会把它算成一直
+        在售。这条断言把当前口径钉死的目的是：以后若改成「按 status_changes
+        重建区间」，必须是有意识地改，而不是悄悄变。"""
+        self._snap("2026-10-15 10:00:00")
+        self._snap("2026-10-17 10:00:00")
+        self._listing("A", "甲苑1幢101", "2026-10-14 09:00:00", sold_at=None)  # 曾售出又复活
+        self.assertEqual([s["alive"] for s in serve.project_snapshots(self.conn, "甲苑", days=3650)],
+                         [1, 1])
 
 
 # ───────────────────────── 4. 爬虫健壮性（GLM 审查回归） ─────────────────────────
@@ -710,6 +827,100 @@ class TestHttpApi(unittest.TestCase):
     def test_unknown_route_is_404(self):
         code, _ = self._request("/api/nope")
         self.assertEqual(code, 404)
+
+    def test_create_subscription_returns_server_id(self):
+        """POST 必须回服务端 id：前端要靠它取消服务端订阅（否则删除后复活）。"""
+        code, body = self._request("/api/subscriptions", method="POST",
+                                   body={"keyword": "某某盘"})
+        self.assertEqual(code, 200)
+        data = json.loads(body)
+        self.assertTrue(data.get("ok"))
+        self.assertIsInstance(data.get("id"), int, f"应返回数字 id，实际 {data!r}")
+        conn = sqlite3.connect(self.db)
+        try:
+            row = conn.execute(
+                "SELECT id, keyword, active FROM subscriptions WHERE id=?",
+                (data["id"],)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, (data["id"], "某某盘", 1), "返回的 id 必须对应真实落库行")
+        # 删掉之后 GET 不能再返回
+        code, _ = self._request("/api/subscriptions/delete", method="POST",
+                                body={"id": data["id"]})
+        self.assertEqual(code, 200)
+        code, body = self._request("/api/subscriptions")
+        self.assertEqual(json.loads(body), [])
+
+
+class TestRealDataIntegrity(unittest.TestCase):
+    """端到端数据自检：拿真实 data/housing.db 跑一遍导出，核对最终产物。
+
+    前面所有测试都是造数据，这里是唯一「真数据」级别的断言：末点偏离、alive
+    汇总错、出现 alive=0 的坏点、别名对不上项目，都会直接红。
+    库先复制到临时目录，保证被测文件只读。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        src = os.path.join(ROOT, "data", "housing.db")
+        if not os.path.exists(src):
+            raise unittest.SkipTest("没有 data/housing.db，跳过真数据自检")
+        cls.tmp = tempfile.mkdtemp(prefix="realdata_")
+        try:
+            cls.db = os.path.join(cls.tmp, "housing.db")
+            shutil.copyfile(src, cls.db)
+            try:
+                cls.payload = export_static.build(cls.db, 30)
+            except sqlite3.DatabaseError as e:
+                raise unittest.SkipTest(f"真实库不可读: {e}")
+            if not cls.payload["projects"]:
+                raise unittest.SkipTest("真实库没有项目数据")
+        except Exception:
+            shutil.rmtree(cls.tmp, ignore_errors=True)
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_every_project_last_point_equals_alive(self):
+        bad = []
+        for pr in self.payload["projects"]:
+            d = self.payload["project_details"][pr["project"]]
+            snaps = d.get("snapshots") or []
+            last = snaps[-1]["alive"] if snaps else None
+            if last != d["alive"]:
+                bad.append((pr["project"], last, d["alive"], len(snaps)))
+        self.assertEqual(bad, [], f"曲线末点与当前在售数不一致: {bad}")
+
+    def test_stats_equals_sum_of_projects(self):
+        p = self.payload
+        self.assertEqual(p["stats"]["alive"], sum(x["alive"] for x in p["projects"]))
+        self.assertEqual(p["stats"]["sold"], sum(x["sold"] for x in p["projects"]))
+        self.assertEqual(p["stats"]["total"], sum(x["total"] for x in p["projects"]))
+        self.assertEqual(p["stats"]["total"],
+                         p["stats"]["alive"] + p["stats"]["sold"])
+
+    def test_no_alive_zero_project(self):
+        zeros = [x["project"] for x in self.payload["projects"] if x["alive"] == 0]
+        self.assertEqual(zeros, [], f"出现 alive=0 的坏点: {zeros}")
+
+    def test_detail_coverage_and_display_names(self):
+        p = self.payload
+        names = {x["project"] for x in p["projects"]}
+        self.assertEqual(set(p["project_details"]), names, "每个项目都必须有预计算详情")
+        self.assertEqual([x["project"] for x in p["projects"] if not x.get("display")], [])
+        # 别名表不能指向不存在的项目（死配置）
+        dead = sorted(set(serve._load_alias()) - names)
+        self.assertEqual(dead, [], f"别名表指向不存在的项目: {dead}")
+
+    def test_trend_points_are_positive_and_ordered(self):
+        t = self.payload["trend"]
+        self.assertGreaterEqual(len(t), 1)
+        self.assertEqual([x["alive"] for x in t if x["alive"] <= 0], [],
+                         "趋势里不能有 alive<=0 的点（假暴跌）")
+        key = [x["date"] + " " + x["time"] for x in t]
+        self.assertEqual(key, sorted(key), "趋势点必须按时间升序")
 
 
 if __name__ == "__main__":

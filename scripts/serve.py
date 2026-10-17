@@ -167,7 +167,7 @@ def project_snapshots(conn, project, days=30):
         return []
     out = []
     for t in times:
-        # 站点时间精度到秒，同一分钟内视为同一时刻
+        # 严格按秒比较：sold_at 与快照同一秒时算「已售」（mark_sold 在快照前执行）
         alive = 0
         for r in rows:
             fs = r.get("first_seen_at") or ""
@@ -175,7 +175,18 @@ def project_snapshots(conn, project, days=30):
             if fs and fs <= t and (not sd or sd > t):
                 alive += 1
         out.append({"date": t[:10], "time": t[11:16], "alive": alive})
-    # 去掉连续重复点会让曲线变粗，这里全保留（前端只画点，不影响）
+
+    # 若最后一轮快照之后还有成交/新增（典型场景：mark_sold 写完 sold_at，
+    # 但在 INSERT snapshots 之前进程被杀），曲线末点会高于真实在售数。
+    # 补一个「现在」点，让末点恒等于当前在售，消除这条结构性偏差。
+    last_t = times[-1]
+    changed_after = any(
+        (r.get("sold_at") and r["sold_at"] > last_t)
+        or (r.get("first_seen_at") and r["first_seen_at"] > last_t)
+        for r in rows)
+    if changed_after:
+        alive_now = sum(1 for r in rows if not r.get("sold_at"))
+        out.append({"date": last_t[:10], "time": "现在", "alive": alive_now})
     return out
 
 
@@ -386,12 +397,14 @@ class Handler(BaseHTTPRequestHandler):
                 kw = (body.get("keyword") or "").strip()
                 if not kw:
                     return self._json({"error": "keyword 不能为空"}, 400)
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO subscriptions (site, keyword, note, created_at) VALUES (?,?,?,?)",
                     ("suzhou-cansale", kw, (body.get("note") or "").strip(),
                      now_cn().strftime("%Y-%m-%d %H:%M:%S")))
                 conn.commit()
-                return self._json({"ok": True})
+                # 必须把服务端 id 返回给前端：前端要拿它做后续「取消订阅」，
+                # 否则本地只存 'L...' id，删除时打不到服务端记录，刷新后订阅复活。
+                return self._json({"ok": True, "id": cur.lastrowid})
             if u.path == "/api/subscriptions/delete":
                 body = self._body_json()
                 sid = body.get("id")

@@ -11,7 +11,12 @@ on:
     - cron: '27 1 * * *'     # 09:27 补
     - cron: '7 2 * * *'      # 10:07 补
     - cron: '37 2 * * *'     # 10:37 补
-  workflow_dispatch:      # 支持手动触发
+  workflow_dispatch:      # 手动触发
+    inputs:
+      force:
+        description: '强制重抓（忽略「今天已抓」守卫）'
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:                # 代码改动时也跑一次，便于验证
@@ -36,28 +41,40 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 补跑守卫：今天已经抓过就别重复抓（多档 cron 里只让第一档真正干活）。
-      # 判据用北京时间的日期，避免 UTC 跨日误判。
+      # 补跑守卫：今天已经「完整」抓过才跳过。
+      # 判据必须含完整性（fetched >= dtot > 0）——只判日期的话，09:07 那档若
+      # 抓一半崩了仍会写快照，后面三档全被跳过，当天数据永久缺页且不自愈。
+      # force=true（手动触发）可强制重抓。
       - name: 检查今天是否已抓取
         id: guard
+        env:
+          FORCE: ${{ inputs.force }}
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import sqlite3, os, sys
           from datetime import datetime, timezone, timedelta
           today = datetime.now(timezone.utc).astimezone(
               timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+          force = str(os.environ.get("FORCE", "")).strip().lower() == "true"
           db = "data/housing.db"
-          last = None
+          last = fetched = dtot = None
           if os.path.exists(db):
               try:
                   c = sqlite3.connect(db)
-                  row = c.execute("SELECT MAX(taken_at) FROM snapshots").fetchone()
-                  last = row[0] if row else None
+                  row = c.execute(
+                      "SELECT taken_at, fetched, dtot FROM snapshots "
+                      "ORDER BY taken_at DESC LIMIT 1").fetchone()
+                  if row:
+                      last, fetched, dtot = row
                   c.close()
               except Exception as e:
                   print(f"# 读库失败（将照常抓取）: {e}", file=sys.stderr)
-          done = bool(last and last[:10] == today)
-          print(f"# 今天={today} 最后快照={last} 已抓过={done}", file=sys.stderr)
+          same_day = bool(last and last[:10] == today)
+          # 完整性：抓到行数必须覆盖站点报的总条数（两列都有值且 >0）
+          complete = bool(fetched and dtot and dtot > 0 and fetched >= dtot)
+          done = same_day and complete and not force
+          print(f"# 今天={today} 最后快照={last} fetched={fetched} dtot={dtot} "
+                f"同日={same_day} 完整={complete} force={force}", file=sys.stderr)
           print(f"done={'true' if done else 'false'}")
           PY
 
