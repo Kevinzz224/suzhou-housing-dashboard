@@ -11,6 +11,11 @@ if python -m unittest discover -s tests -p 'test_unit.py' 2>&1 | tail -4; then :
 python -m unittest discover -s tests -p 'test_unit.py' >/dev/null 2>&1 || FAILED=1
 
 echo
+echo "══════ 1.5/3 CI 工作流守卫（今天已抓则跳过 / 多档 cron 冗余）══════"
+python tests/test_workflow_guard.py 2>&1 | tail -3
+python -m unittest tests.test_workflow_guard >/dev/null 2>&1 || FAILED=1
+
+echo
 echo "══════ 2/3 前端静态检查（零依赖，CI 第一道门禁）══════"
 python tests/test_frontend_lint.py || FAILED=1
 

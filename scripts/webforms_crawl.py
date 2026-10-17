@@ -357,7 +357,10 @@ def main():
     # 有翻页失败时不做消失判定，避免把"没爬到"误判成"已售"
     n_sold = 0
     if not failed_pages:
-        n_sold = mark_sold(conn, site.name, seen_keys, time.strftime("%Y-%m-%d %H:%M:%S"))
+        # 必须用 now_cn()：GitHub Actions runner 是 UTC，直接 time.strftime 会让
+        # status_changes 记 UTC、snapshots 记北京时间，同一轮数据出现两个时区
+        # （2026-10-17 首次真实成交就暴露了：快照 10:17 vs 变化 02:17）。
+        n_sold = mark_sold(conn, site.name, seen_keys, now_cn())
         if n_sold:
             print(f"[sold] 本轮新检出已售/下架 {n_sold} 套")
     else:
@@ -371,10 +374,11 @@ def main():
     #   total   = 本轮实际抓到的行数（旧代码写错了语义，保留兼容不动）
     #   fetched = 同上，语义明确的别名
     #   dtot    = 站点页面报的数据集总条数（"共 N 条"）
+    run_ts = now_cn()          # 本轮统一时间戳，快照与变化记录必须一致
     conn.execute(
         "INSERT INTO snapshots (site,taken_at,query,total,new,changed,sold,alive,fetched,dtot)"
         " VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (site.name, now_cn(), json.dumps(params, ensure_ascii=False),
+        (site.name, run_ts, json.dumps(params, ensure_ascii=False),
          all_rows, n_new, n_chg, n_sold, alive, all_rows, total or 0),
     )
     conn.commit()

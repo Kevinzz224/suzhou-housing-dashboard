@@ -1,0 +1,11 @@
+# SQLite 是二进制，绝不能被 CRLF 转换（core.autocrlf=true 下的真实隐患）
+*.db binary
+*.sqlite binary
+*.png binary
+# 文本文件统一 LF
+*.py text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.md text eol=lf

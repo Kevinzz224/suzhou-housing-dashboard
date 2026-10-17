@@ -2,13 +2,15 @@ name: 每日抓取苏州楼市数据
 
 on:
   schedule:
-    # GitHub Actions 用 UTC。北京时间 9:00 = UTC 1:00。
-    # 多档重试：GitHub 定时任务在高负载时会「丢弃」排队中的运行（官方文档承认），
-    # 单档 cron 实测会整点漏跑（2026-10-17 北京 9:00 首次验证就漏了）。
-    # 抓取是幂等的（同一天多跑只是多几条快照），所以用多档冗余换可靠性。
-    - cron: '0 1 * * *'      # 09:00 北京
-    - cron: '30 1 * * *'     # 09:30 重试
-    - cron: '0 2 * * *'      # 10:00 重试
+    # GitHub Actions 的 cron 只用 UTC，且是「尽力而为」：官方文档明确说高负载时
+    # 排队的运行会被直接丢弃、无重试无通知。整点（:00）是全球最拥挤的时刻
+    # （所有人都在 0 * * * *），实测 2026-10-17 北京 9:00 首次上线就整点漏跑。
+    # 对策三条：① 避开整点用奇数分钟 ② 多档冗余，前面漏了后面补
+    # ③ 抓取幂等，多跑只是多一条快照，不污染数据
+    - cron: '7 1 * * *'      # 09:07 北京（主）
+    - cron: '27 1 * * *'     # 09:27 补
+    - cron: '7 2 * * *'      # 10:07 补
+    - cron: '37 2 * * *'     # 10:37 补
   workflow_dispatch:      # 支持手动触发
   push:
     branches: [main]
@@ -34,8 +36,34 @@ jobs:
         with:
           python-version: '3.12'
 
+      # 补跑守卫：今天已经抓过就别重复抓（多档 cron 里只让第一档真正干活）。
+      # 判据用北京时间的日期，避免 UTC 跨日误判。
+      - name: 检查今天是否已抓取
+        id: guard
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import sqlite3, os, sys
+          from datetime import datetime, timezone, timedelta
+          today = datetime.now(timezone.utc).astimezone(
+              timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+          db = "data/housing.db"
+          last = None
+          if os.path.exists(db):
+              try:
+                  c = sqlite3.connect(db)
+                  row = c.execute("SELECT MAX(taken_at) FROM snapshots").fetchone()
+                  last = row[0] if row else None
+                  c.close()
+              except Exception as e:
+                  print(f"# 读库失败（将照常抓取）: {e}", file=sys.stderr)
+          done = bool(last and last[:10] == today)
+          print(f"# 今天={today} 最后快照={last} 已抓过={done}", file=sys.stderr)
+          print(f"done={'true' if done else 'false'}")
+          PY
+
       # 零第三方依赖：只用标准库，不需要 pip install
       - name: 抓取数据
+        if: steps.guard.outputs.done != 'true'
         run: |
           python scripts/webforms_crawl.py \
             --site scripts/sites/suzhou.json \
@@ -52,12 +80,14 @@ jobs:
             --interval 1.2
 
       - name: 导出静态 JSON
+        if: steps.guard.outputs.done != 'true'
         run: |
           python scripts/export_static.py \
             --db data/housing.db \
             --out web/data.json
 
       - name: 提交数据变更
+        if: steps.guard.outputs.done != 'true'
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
@@ -73,3 +103,7 @@ jobs:
               sleep 5
             done
           fi
+
+      - name: 报告跳过原因
+        if: steps.guard.outputs.done == 'true'
+        run: echo "今天已有快照，跳过抓取（这是补跑档，正常现象）"
