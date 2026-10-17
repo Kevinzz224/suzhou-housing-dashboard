@@ -125,6 +125,37 @@ def api_projects(conn, site=None):
     return out
 
 
+def project_snapshots(conn, project, days=30):
+    """按项目重算存量曲线：某个快照时刻 T，该项目在售数 =
+    first_seen_at <= T 且 (sold_at 为空 或 sold_at > T) 的房源数。
+
+    为什么不用 snapshots.alive：那是全站数字，直接画到项目页会串数据。
+    """
+    now = datetime.now()
+    cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+    times = [r["taken_at"] for r in
+             q(conn, "SELECT DISTINCT taken_at FROM snapshots ORDER BY taken_at")
+             if r["taken_at"] >= cutoff]
+    if not times:
+        return []
+    rows = [r for r in q(conn, "SELECT location, first_seen_at, sold_at FROM listings")
+            if project_of(r.get("location")) == project]
+    if not rows:
+        return []
+    out = []
+    for t in times:
+        # 站点时间精度到秒，同一分钟内视为同一时刻
+        alive = 0
+        for r in rows:
+            fs = r.get("first_seen_at") or ""
+            sd = r.get("sold_at") or ""
+            if fs and fs <= t and (not sd or sd > t):
+                alive += 1
+        out.append({"date": t[:10], "time": t[11:16], "alive": alive})
+    # 去掉连续重复点会让曲线变粗，这里全保留（前端只画点，不影响）
+    return out
+
+
 def api_project(conn, name, days=30):
     rows = q(conn, "SELECT * FROM listings")
     rows = [r for r in rows if project_of(r.get("location")) == name]
@@ -145,12 +176,12 @@ def api_project(conn, name, days=30):
         """最近 d 天内成交的：sold_at 落在窗口内；新房源：first_seen_at 落在窗口内。"""
         return within(r, d, "sold_at")
 
-    # 快照序列（项目级曲线用的是全库快照——站点一次查询就是整个筛选集，
-    # 所以项目曲线与全局曲线同源；alive=0 的历史坏快照必须剔除）
-    snaps = q(conn, "SELECT taken_at, alive, sold, total FROM snapshots ORDER BY taken_at")
-    snaps = [s for s in snaps
-             if s.get("alive") not in (None, 0)
-             and s["taken_at"] >= (now - timedelta(days=days)).strftime("%Y-%m-%d")]
+    # 快照序列 —— 必须按「本项目」重算，不能直接读全库 snapshots。
+    # 曾经直接复用全站快照，导致每个项目详情页都画同一条全站曲线：
+    # 君华雅筑卖掉 1 套，30 个项目全都显示 -1（用户报的真 bug）。
+    # 这里用 listings 的 first_seen_at / sold_at 反推各时刻的在售数，
+    # 好处是不需要新表，历史数据也能立刻算对。
+    snaps = project_snapshots(conn, name, days)
 
     sold7 = [r for r in rows if in_range(r, 7)]
     sold30 = [r for r in rows if in_range(r, 30)]
@@ -191,10 +222,8 @@ def api_project(conn, name, days=30):
         "sold_rate_30d": sold30_rate,
         "amount_30d_wan": round(amt30, 1),
         "days_to_clear": days_to_clear,
-        "snapshots": [
-            {"date": s["taken_at"][:10], "alive": s["alive"], "sold": s["sold"]}
-            for s in snaps
-        ],
+        # project_snapshots() 已按项目算好，直接透传
+        "snapshots": snaps,
         "recent_sold": [
             {"location": r.get("location"), "area": r.get("area"),
              "price": r.get("price"), "sold_at": (r.get("sold_at") or "")[:10]}

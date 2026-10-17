@@ -325,5 +325,71 @@ class TestDbLayer(unittest.TestCase):
                                       wf.now_cn()), 0)
 
 
+class TestProjectSnapshots(unittest.TestCase):
+    """项目级存量曲线必须按项目算，不能复用全站快照。
+
+    真实 bug（用户报的「-1 套」）：君华雅筑卖掉 1 套，
+    30 个项目详情页全都显示 -1 —— 因为直接读了 snapshots.alive（全站数字）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ps_")
+        self.db = os.path.join(self.tmp, "t.db")
+        self.conn = wf.init_db(self.db)
+        # 造 3 个快照时刻
+        # 时间轴设计（避免"售出"和"新增"撞在同一秒，否则永远看不到中间态）：
+        #   23:00 -> A1,A2           = 2
+        #   09:00 -> A1,A2           = 2（A3 尚未出现）
+        #   10:00 -> A1,A2,A3        = 3（A3 于 09:30 上架）
+        #   12:00 -> A1,A3           = 2（A2 于 11:00 售出）
+        self.times = ["2026-10-16 23:00:00", "2026-10-17 09:00:00",
+                      "2026-10-17 10:00:00", "2026-10-17 12:00:00"]
+        for t in self.times:
+            self.conn.execute(
+                "INSERT INTO snapshots (site,taken_at,query,total,new,changed,sold,alive)"
+                " VALUES ('s',?,'{}',0,0,0,0,0)", (t,))
+        rows = [
+            ("A1", "甲苑1幢101", "2026-10-16 22:00:00", None),          # 一直在售
+            ("A2", "甲苑1幢102", "2026-10-16 22:00:00", "2026-10-17 11:00:00"),  # 11点售出
+            ("A3", "甲苑1幢103", "2026-10-17 09:30:00", None),          # 09:30 上架
+            ("B1", "乙苑1幢201", "2026-10-16 22:00:00", None),          # 对照组
+        ]
+        for k, loc, fs, sd in rows:
+            self.conn.execute(
+                "INSERT INTO listings (site,key_id,first_seen_at,last_seen_at,location,sold_at)"
+                " VALUES ('s',?,?,?,?,?)", (k, fs, fs, loc, sd))
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_curve_is_per_project(self):
+        snaps = serve.project_snapshots(self.conn, "甲苑", days=3650)
+        vals = [s["alive"] for s in snaps]
+        self.assertEqual(vals, [2, 2, 3, 2],
+                         "甲苑：A3 于 09:30 上架(10:00 点看到 3)，A2 于 11:00 售出(12:00 点回落到 2)")
+
+    def test_untouched_project_stays_flat(self):
+        """没成交的项目曲线必须是平的（这就是用户报的 bug）。"""
+        snaps = serve.project_snapshots(self.conn, "乙苑", days=3650)
+        self.assertEqual([s["alive"] for s in snaps], [1, 1, 1, 1],
+                         "乙苑没有任何变化，不能出现 -1")
+
+    def test_last_point_equals_current_alive(self):
+        d = serve.api_project(self.conn, "甲苑", days=3650)
+        self.assertEqual(d["snapshots"][-1]["alive"], d["alive"],
+                         "曲线末点必须等于当前在售数")
+
+    def test_different_projects_differ(self):
+        a = serve.api_project(self.conn, "甲苑", days=3650)
+        b = serve.api_project(self.conn, "乙苑", days=3650)
+        self.assertNotEqual([s["alive"] for s in a["snapshots"]],
+                            [s["alive"] for s in b["snapshots"]],
+                            "两个项目的曲线不应相同")
+
+    def test_unknown_project_returns_empty(self):
+        self.assertEqual(serve.project_snapshots(self.conn, "不存在", days=3650), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
