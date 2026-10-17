@@ -151,6 +151,15 @@ class TestWorkflowConfig(unittest.TestCase):
         self.assertTrue(os.path.exists(ga), "缺少 .gitattributes")
         self.assertIn("*.db binary", open(ga, encoding="utf-8").read())
 
+    def test_push_retry_fails_step_after_three_failures(self):
+        """回归：循环最后一条是 sleep 时，3 次 push 全失败也会以退出码 0 结束。"""
+        self.assertIn("ok=0", self.src)
+        self.assertIn("if git pull --rebase --autostash origin main && git push; then", self.src)
+        self.assertIn("ok=1", self.src)
+        self.assertIn('[ "$ok" = 1 ] ||', self.src)
+        self.assertIn("exit 1", self.src.split('[ "$ok" = 1 ] ||', 1)[1],
+                      "push 全失败后必须非零退出，否则 CI 绿色但数据没上传")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

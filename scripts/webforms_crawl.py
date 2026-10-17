@@ -42,7 +42,33 @@ def now_cn():
         timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def query_key(query):
+    """查询条件的稳定序列化（key 排序），用于 listings/snapshots 对齐。
+    dict 遍历顺序会随 --param 顺序变，直接 json.dumps 会把同一条件判成不同 query。"""
+    return json.dumps(dict(query), ensure_ascii=False, sort_keys=True)
+
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+
+def decode_page(raw):
+    """把 curl 返回的 bytes 按页面声明的 charset 解码。
+
+    不能用 subprocess.run(text=True)：它会按运行机 locale 解码（Windows 常是
+    cp936，CI 是 UTF-8）。页面编码和 locale 不一致时中文会变乱码，row_regex
+    全失配，最后表现成误导性的「查询返回空结果」。默认按 UTF-8，政务站大多如此。
+    """
+    if isinstance(raw, str):
+        return raw
+    if not raw:
+        return ""
+    head = raw[:4096].decode("latin-1", "ignore")
+    m = re.search(r"<meta[^>]+charset=[\"']?([A-Za-z0-9_-]+)", head, re.I)
+    enc = (m.group(1).lower() if m else "utf-8")
+    try:
+        return raw.decode(enc, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
 
 
 def http(url, data=None, timeout=90, proxy=None, referer=None, cookie_jar=None):
@@ -67,10 +93,11 @@ def http(url, data=None, timeout=90, proxy=None, referer=None, cookie_jar=None):
         cmd[-1:-1] = ["--data-binary", "@" + body_file,
                       "-H", "Content-Type: application/x-www-form-urlencoded"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 15)
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout + 15)
         if r.returncode != 0:
-            raise RuntimeError(f"curl 失败: {r.stderr[:200]}")
-        return r.stdout
+            err = r.stderr.decode("utf-8", "replace") if isinstance(r.stderr, bytes) else str(r.stderr)
+            raise RuntimeError(f"curl 失败: {err[:200]}")
+        return decode_page(r.stdout)
     finally:
         if body_file:
             try:
@@ -181,8 +208,11 @@ class Site:
         return int(m.group(1)) if m else None
 
 
-def db_upsert(conn, site_name, rows, site):
-    """增量入库：新记录插入；已存在则更新 last_seen_at，状态变化记 status_changes。"""
+def db_upsert(conn, site_name, rows, site, query=None):
+    """增量入库：新记录插入；已存在则更新 last_seen_at，状态变化记 status_changes。
+
+    query 传入时把「本轮查询条件」写到 listings.query：消失判定必须只作用于同一
+    查询条件覆盖的房源，否则换 --param 跑一次会把条件外房源误判成已售。"""
     cur = conn.cursor()
     now = now_cn()
     new, changed = 0, 0
@@ -195,6 +225,9 @@ def db_upsert(conn, site_name, rows, site):
         if old is None:
             cols = ["site", "key_id", "first_seen_at", "last_seen_at"] + list(r.keys())
             vals = [site_name, key, now, now] + [r[c] for c in r]
+            if query is not None and "query" not in cols:
+                cols.append("query")
+                vals.append(query)
             cur.execute(
                 f"INSERT INTO listings ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                 vals,
@@ -209,9 +242,23 @@ def db_upsert(conn, site_name, rows, site):
                      oldmap.get(site.status_field), r.get(site.status_field), now),
                 )
                 changed += 1
+            # 已售房源重新出现 = 退房再售/撤销重挂（或上一轮误标）。UPDATE 列来自
+            # r，不含 sold_at，旧代码会让 sold_at 永久残留；这里显式复活并记一条
+            # availability 变化，去化统计才不会把「重新在售」继续算作已售。
+            if oldmap.get("sold_at"):
+                cur.execute("UPDATE listings SET sold_at=NULL WHERE site=? AND key_id=?",
+                            (site_name, key))
+                cur.execute(
+                    "INSERT INTO status_changes (site,key_id,field,old,new,changed_at) VALUES (?,?,?,?,?,?)",
+                    (site_name, key, "availability", "已售/下架", "可售", now),
+                )
+                changed += 1
             for col, val in r.items():
                 cur.execute(f"UPDATE listings SET [{col}]=?, last_seen_at=? WHERE site=? AND key_id=?",
                             (val, now, site_name, key))
+            if query is not None:
+                cur.execute("UPDATE listings SET query=? WHERE site=? AND key_id=?",
+                            (query, site_name, key))
     conn.commit()
     return new, changed
 
@@ -223,6 +270,7 @@ def init_db(path):
         site TEXT, key_id TEXT, first_seen_at TEXT, last_seen_at TEXT,
         project TEXT, location TEXT, company TEXT, usage TEXT, layout TEXT,
         area REAL, price REAL, total REAL, status TEXT, extra TEXT,
+        query TEXT DEFAULT NULL,
         sold_at TEXT DEFAULT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_listings_key ON listings(site, key_id);
@@ -245,6 +293,7 @@ def init_db(path):
     # 注意：所有新增列都必须登记在这里，否则老库升级后会缺列报错。
     for tbl, col, ddl in [
         ("listings", "sold_at", "TEXT DEFAULT NULL"),
+        ("listings", "query", "TEXT DEFAULT NULL"),
         ("status_changes", "pushed_at", "TEXT DEFAULT NULL"),
         ("snapshots", "sold", "INTEGER DEFAULT 0"),
         ("snapshots", "alive", "INTEGER DEFAULT 0"),
@@ -259,12 +308,20 @@ def init_db(path):
     return conn
 
 
-def mark_sold(conn, site_name, seen_keys, now):
+def mark_sold(conn, site_name, seen_keys, now, query=None):
     """本轮没出现在可售列表里的房源 => 已售/下架。
-    这是"去化速度"的数据来源：可售列表只显示未售房源，消失即成交。"""
+    这是"去化速度"的数据来源：可售列表只显示未售房源，消失即成交。
+
+    query 传入时只判定同一查询条件覆盖的房源；不同 --param 抓出来的 listings
+    绝不能互相判死（严重问题：换查询条件会把条件外房源全部误标已售）。"""
     cur = conn.cursor()
-    cur.execute("SELECT key_id, sold_at FROM listings WHERE site=? AND sold_at IS NULL",
-                (site_name,))
+    if query is None:
+        cur.execute("SELECT key_id, sold_at FROM listings WHERE site=? AND sold_at IS NULL",
+                    (site_name,))
+    else:
+        cur.execute("SELECT key_id, sold_at FROM listings"
+                    " WHERE site=? AND sold_at IS NULL AND query=?",
+                    (site_name, query))
     gone = [k for (k, _) in cur.fetchall() if k not in seen_keys]
     for k in gone:
         cur.execute("UPDATE listings SET sold_at=? WHERE site=? AND key_id=?", (now, site_name, k))
@@ -274,6 +331,64 @@ def mark_sold(conn, site_name, seen_keys, now):
         )
     conn.commit()
     return len(gone)
+
+
+def disappearance_guard(conn, site_name, query, *, pages_known, failed_pages,
+                        all_rows, total, max_pages):
+    """消失判定（mark_sold）的安全门：不满足完整性就跳过。
+
+    为什么必须这么严：mark_sold 的前提是「本轮 seen_keys 覆盖该查询的全部在售
+    结果集」。手动 --max-pages 截断、分页条文案变化导致只抓第 1 页、换查询条件，
+    都会让大批活房源「消失」而被误标已售。这里把每种不完整情形都拦下并给出原因。
+    返回 (是否允许, 跳过原因)。
+    """
+    if max_pages:
+        return False, f"使用了 --max-pages={max_pages}，结果集被截断"
+    if failed_pages:
+        return False, f"有失败页 {failed_pages}"
+    if not pages_known:
+        return False, "分页总数未识别（共 N 页 正则失配），无法确认已抓全"
+    if total is not None and all_rows != total:
+        return False, f"抓到 {all_rows} 行 ≠ 站点总数 {total} 条，结果集不完整"
+    if all_rows <= 0:
+        return False, "本轮 0 行，无法区分「真的售罄」和「查询/解析异常」"
+    prev = conn.execute(
+        "SELECT query FROM snapshots WHERE site=? ORDER BY id DESC LIMIT 1",
+        (site_name,)).fetchone()
+    if not prev:
+        return False, "没有上一轮快照可比对查询条件，首轮不做消失判定"
+    try:
+        prev_query = json.loads(prev[0] or "{}")
+    except json.JSONDecodeError:
+        prev_query = None
+    if prev_query != dict(query):
+        return False, "查询条件与上一轮不一致，条件外房源会被误判消失"
+    return True, ""
+
+
+def fetch_first_page(site, params, use_proxy):
+    """抓第一页；直连失败且允许代理时才逐个走代理池兜底。
+
+    旧代码拿到代理列表后仍调 site.fetch_page(params)（没传 proxy），等于拿完代理
+    继续直连重试，是纯死代码。这里逐个代理试，全部失败才把最后的错误抛出去。
+    """
+    try:
+        return site.fetch_page(params)
+    except Exception as e:
+        if not use_proxy:
+            raise
+        print(f"[warn] 直连失败: {e}，试代理池")
+        proxies = proxies_from_pool()
+        if not proxies:
+            raise
+        last = e
+        for p in proxies:
+            try:
+                return site.fetch_page(params, proxy=p)
+            except Exception as pe:
+                print(f"[warn] 代理 {p} 失败: {pe}")
+                last = pe
+        raise last
 
 
 def proxies_from_pool():
@@ -304,32 +419,25 @@ def main():
     with open(args.site, "r", encoding="utf-8") as f:
         site = Site(json.load(f), cookie_jar=args.cookies)
     params = dict(kv.split("=", 1) for kv in args.param)
+    qkey = query_key(params)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.db)), exist_ok=True)
     conn = init_db(args.db)
 
     # 第一页（带查询条件）
-    try:
-        page = site.fetch_page(params)
-    except Exception as e:
-        if not args.use_proxy:
-            raise
-        print(f"[warn] 直连失败: {e}，试代理池")
-        proxies = proxies_from_pool()
-        if not proxies:
-            raise
-        page = site.fetch_page(params)
+    page = fetch_first_page(site, params, args.use_proxy)
 
     total = site.total_count(page)
     rows = site.parse_rows(page)
     if not rows:
         print("[warn] 第一页没解析到数据，检查 row_regex 是否匹配当前页面")
-    n_new, n_chg = db_upsert(conn, site.name, rows, site)
+    n_new, n_chg = db_upsert(conn, site.name, rows, site, query=qkey)
     print(f"[page 1] {len(rows)} 行 (新增 {n_new}, 状态变化 {n_chg})" + (f", 共 {total} 条" if total else ""))
     all_rows = len(rows)
 
     # 从文本里算总页数："共 N 页"
     m = re.search(r"共\s*(\d+)\s*页", visible_text(page))
+    pages_known = m is not None
     pages = int(m.group(1)) if m else 1
     if args.max_pages:
         pages = min(pages, args.max_pages)
@@ -345,7 +453,7 @@ def main():
                 failed_pages.append(p + 1)
                 continue
             prev_fields = hidden_fields(pg)  # 链式更新
-            a, b = db_upsert(conn, site.name, prs, site)
+            a, b = db_upsert(conn, site.name, prs, site, query=qkey)
             all_rows += len(prs)
             seen_keys.update(r.get(site.key_field) for r in prs)
             print(f"[page {p+1}/{pages}] {len(prs)} 行 (新增 {a}, 变化 {b})")
@@ -354,17 +462,27 @@ def main():
             failed_pages.append(p + 1)
         time.sleep(args.interval)
 
-    # 有翻页失败时不做消失判定，避免把"没爬到"误判成"已售"
+    # 消失判定前先过安全门：结果集不完整（截断/分页失配/失败页/换查询条件）时
+    # 绝不能把「没爬到」误判成「已售」。
     n_sold = 0
-    if not failed_pages:
+    can_sold, why = disappearance_guard(
+        conn, site.name, params, pages_known=pages_known,
+        failed_pages=failed_pages, all_rows=all_rows, total=total,
+        max_pages=args.max_pages)
+    if can_sold:
+        # 老库 listings 没有 query 列（补列后是 NULL）。本项目的在售库历史以来只有
+        # 这一个查询条件，安全门又已确认本轮 query 与上轮一致，因此把 NULL 老行
+        # 回填到本轮 query，否则这些「上个版本抓取的在售房」永远不会参与消失判定。
+        conn.execute("UPDATE listings SET query=? WHERE site=? AND query IS NULL",
+                     (qkey, site.name))
         # 必须用 now_cn()：GitHub Actions runner 是 UTC，直接 time.strftime 会让
         # status_changes 记 UTC、snapshots 记北京时间，同一轮数据出现两个时区
         # （2026-10-17 首次真实成交就暴露了：快照 10:17 vs 变化 02:17）。
-        n_sold = mark_sold(conn, site.name, seen_keys, now_cn())
+        n_sold = mark_sold(conn, site.name, seen_keys, now_cn(), query=qkey)
         if n_sold:
             print(f"[sold] 本轮新检出已售/下架 {n_sold} 套")
     else:
-        print(f"[sold] 因有失败页 {failed_pages}，跳过消失判定")
+        print(f"[sold] 跳过消失判定：{why}")
 
     cur = conn.execute(
         "SELECT COUNT(*) FROM listings WHERE site=? AND sold_at IS NULL", (site.name,))
@@ -378,7 +496,7 @@ def main():
     conn.execute(
         "INSERT INTO snapshots (site,taken_at,query,total,new,changed,sold,alive,fetched,dtot)"
         " VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (site.name, run_ts, json.dumps(params, ensure_ascii=False),
+        (site.name, run_ts, qkey,
          all_rows, n_new, n_chg, n_sold, alive, all_rows, total or 0),
     )
     conn.commit()

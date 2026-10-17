@@ -323,6 +323,26 @@ class DashboardE2E(unittest.TestCase):
         self.assertEqual(self.cdp.eval("document.querySelector('#listView').style.display"), "")
         self.assertEqual(self.cdp.eval("document.querySelector('#detailView').style.display"), "none")
 
+    def test_21_detail_shows_real_project_data(self):
+        """详情页不能只「能打开」：必须渲染本项目的数据（曲线点数/在售表/套数）。"""
+        self.cdp.eval("window.__e2e_key=document.querySelector('#projects .card').dataset.p")
+        self.cdp.eval("document.querySelector('#projects .card').click()")
+        self.wait_for("document.querySelector('#detailView').style.display === 'block'")
+        d = self.cdp.eval("CACHE.project_details[window.__e2e_key]")
+        self.assertTrue(d, "data.json 里应有该项目的预计算详情")
+        txt = self.cdp.eval("document.querySelector('#detailView').innerText")
+        self.assertIn(f"{d['alive']} 套", txt)
+        if d.get("alive_list"):
+            self.assertIn(d["alive_list"][0]["location"], txt)
+        snaps = d.get("snapshots") or []
+        if len(snaps) >= 2:
+            npts = self.cdp.eval(
+                "(()=>{const p=document.querySelector('#detailView .spark polyline');"
+                "return p ? p.getAttribute('points').trim().split(/\\s+/).length : 0})()")
+            self.assertEqual(npts, len(snaps), "存量趋势点数应与快照数一致")
+        else:
+            self.assertIn("数据点不足", txt)
+
     # ── 订阅：增删改查（之前的 bug 重灾区）────────────────
 
     def test_30_subscribe_adds_local_chip(self):

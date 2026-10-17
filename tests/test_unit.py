@@ -5,15 +5,22 @@
     python -m unittest discover -s tests -v
     python tests/test_unit.py
 """
+import json
 import os
 import re
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
+from http.server import ThreadingHTTPServer
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
 SCRIPTS = os.path.abspath(os.path.join(HERE, "..", "scripts"))
 sys.path.insert(0, SCRIPTS)
 
@@ -217,6 +224,21 @@ class TestAlias(unittest.TestCase):
         for k in alias:
             self.assertRegex(k, r"^[\u4e00-\u9fa5A-Za-z]+$")
 
+    def test_alias_keys_exist_in_real_db(self):
+        """只验正则挡不住「写错备案名」；必须对照真实库里的项目名。"""
+        db = os.path.join(ROOT, "data", "housing.db")
+        if not os.path.exists(db):
+            self.skipTest("无真实库可对照")
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            projects = {serve.project_of(r[0]) for r in conn.execute("SELECT location FROM listings")}
+        finally:
+            conn.close()
+        if not projects:
+            self.skipTest("真实库为空")
+        missing = sorted(set(serve._load_alias()) - projects)
+        self.assertEqual(missing, [], "别名表 key 必须是库里真实存在的备案名")
+
 
 # ───────────────────────── 3. 数据库与增量 ─────────────────────────
 
@@ -259,6 +281,7 @@ class TestDbLayer(unittest.TestCase):
         cols_s = {r[1] for r in c2.execute("PRAGMA table_info(snapshots)")}
         c2.close()
         self.assertIn("sold_at", cols_l)
+        self.assertIn("query", cols_l)
         for col in ("sold", "alive", "fetched", "dtot"):
             self.assertIn(col, cols_s)
 
@@ -323,6 +346,36 @@ class TestDbLayer(unittest.TestCase):
         wf.db_upsert(self.conn, "test", self._rows(3), self.site)
         self.assertEqual(wf.mark_sold(self.conn, "test", {"K0", "K1", "K2"},
                                       wf.now_cn()), 0)
+
+    def test_upsert_revives_resold_listing(self):
+        """已售房源重新出现时必须清 sold_at 并记「复活」，否则误标会永久化。"""
+        wf.db_upsert(self.conn, "test", self._rows(3), self.site)
+        wf.mark_sold(self.conn, "test", {"K0", "K1"}, wf.now_cn())   # K2 先被判已售
+        n_new, n_chg = wf.db_upsert(self.conn, "test", self._rows(3), self.site)
+        self.assertEqual(n_new, 0)
+        self.assertEqual(n_chg, 1, "K2 复活应计为一次 availability 变化")
+        self.assertIsNone(self.conn.execute(
+            "SELECT sold_at FROM listings WHERE key_id='K2'").fetchone()[0])
+        last = self.conn.execute(
+            "SELECT old, new FROM status_changes WHERE key_id='K2' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(last), ("已售/下架", "可售"))
+
+    def test_mark_sold_is_scoped_to_current_query(self):
+        """换 --param 抓另一个条件时，条件外房源绝不能被本轮消失判定误杀。"""
+        qa, qb = wf.query_key({"area": "140-180"}), wf.query_key({"area": "90-120"})
+        ra = self._rows(2)
+        rb = self._rows(1)
+        rb[0]["key_id"] = "B0"
+        wf.db_upsert(self.conn, "test", ra, self.site, query=qa)
+        wf.db_upsert(self.conn, "test", rb, self.site, query=qb)
+        n = wf.mark_sold(self.conn, "test", {"K0"}, wf.now_cn(), query=qa)
+        self.assertEqual(n, 1, "同一 query 下没出现的 K1 才应判已售")
+        sold = {r[0] for r in self.conn.execute(
+            "SELECT key_id FROM listings WHERE sold_at IS NOT NULL")}
+        self.assertEqual(sold, {"K1"})
+        self.assertIsNone(self.conn.execute(
+            "SELECT sold_at FROM listings WHERE key_id='B0'").fetchone()[0])
 
 
 class TestProjectSnapshots(unittest.TestCase):
@@ -389,6 +442,274 @@ class TestProjectSnapshots(unittest.TestCase):
 
     def test_unknown_project_returns_empty(self):
         self.assertEqual(serve.project_snapshots(self.conn, "不存在", days=3650), [])
+
+
+# ───────────────────────── 4. 爬虫健壮性（GLM 审查回归） ─────────────────────────
+
+class TestDecodePage(unittest.TestCase):
+    def test_defaults_to_utf8_without_meta(self):
+        raw = "<html><body>中文可售</body></html>".encode("utf-8")
+        self.assertEqual(wf.decode_page(raw), "<html><body>中文可售</body></html>")
+
+    def test_respects_meta_charset_gbk(self):
+        raw = '<meta charset="gbk"><html><body>中文可售</body></html>'.encode("gbk")
+        self.assertEqual(wf.decode_page(raw),
+                         '<meta charset="gbk"><html><body>中文可售</body></html>')
+
+    def test_unknown_charset_falls_back_to_utf8(self):
+        raw = '<meta charset="x-no-such-charset"><html>中文</html>'.encode("utf-8")
+        self.assertIn("中文", wf.decode_page(raw))
+
+
+class TestHttpEncoding(unittest.TestCase):
+    def test_http_decodes_bytes_explicitly_not_by_locale(self):
+        """subprocess.run 不能再带 text=True（Windows cp936 会把 UTF-8 页面解成乱码）。"""
+        fake = mock.Mock(returncode=0, stdout="<html>中文</html>".encode("utf-8"), stderr=b"")
+        with mock.patch.object(wf.subprocess, "run", return_value=fake) as m:
+            got = wf.http("http://example.test")
+        self.assertEqual(got, "<html>中文</html>")
+        self.assertNotIn("text", m.call_args.kwargs)
+
+
+class TestFetchPageLogic(unittest.TestCase):
+    HIDDEN_ONLY = (
+        '<input type="hidden" name="__VIEWSTATE" value="v" />'
+        '<input type="hidden" name="__EVENTVALIDATION" value="e" />'
+        '<html><body>no rows</body></html>'
+    )
+
+    def setUp(self):
+        self.site = wf.Site(site_cfg())
+
+    def test_query_params_are_qualified_and_empty_dropped(self):
+        calls = []
+        self.site._http = lambda data=None, proxy=None: (calls.append(data), SAMPLE_PAGE_HTML)[1]
+        self.site.fetch_page({"txt_Pro": "", "ddl_qy": "RD002"}, retries=1)
+        self.assertIsNone(calls[0], "查询前必须先 GET 拿 VIEWSTATE")
+        sent = calls[1]
+        self.assertEqual(sent["ctl00$MainContent$ddl_qy"], "RD002")
+        self.assertNotIn("ctl00$MainContent$txt_Pro", sent, "空串参数会让站点丢查询条件")
+        self.assertEqual(sent["ctl00$MainContent$bt_select"], "查询")
+
+    def test_empty_result_retries_then_raises(self):
+        calls = []
+        self.site._http = lambda data=None, proxy=None: (calls.append(data), self.HIDDEN_ONLY)[1]
+        with self.assertRaises(RuntimeError):
+            self.site.fetch_page({}, retries=2)
+        self.assertEqual(len(calls), 4, "每次尝试 = GET 拿隐藏域 + POST 查询，共 2 轮")
+
+    def test_paging_uses_prev_fields_and_event_target(self):
+        calls = []
+        self.site._http = lambda data=None, proxy=None: (calls.append(data), SAMPLE_PAGE_HTML)[1]
+        prev = {"__VIEWSTATE": "v2", "__EVENTVALIDATION": "e2"}
+        self.site.fetch_page({}, page_idx=1, prev_fields=prev, retries=1)
+        self.assertEqual(len(calls), 1, "翻页必须用上一页隐藏域，不能重新 GET")
+        sent = calls[0]
+        self.assertEqual(sent["__VIEWSTATE"], "v2")
+        self.assertEqual(sent["__EVENTTARGET"], self.site.pager_target)
+        self.assertEqual(sent[self.site.pager_field], "1")
+
+
+class TestProxyFallback(unittest.TestCase):
+    class FakeSite:
+        name = "fake"
+
+        def __init__(self, script):
+            self.script = script
+            self.calls = []
+
+        def fetch_page(self, params, proxy=None):
+            self.calls.append(proxy)
+            got = self.script(proxy)
+            if isinstance(got, Exception):
+                raise got
+            return got
+
+    def test_direct_success_never_touches_proxy_pool(self):
+        site = self.FakeSite(lambda proxy: "ok")
+        with mock.patch.object(wf, "proxies_from_pool") as pool:
+            self.assertEqual(wf.fetch_first_page(site, {}, use_proxy=True), "ok")
+        pool.assert_not_called()
+        self.assertEqual(site.calls, [None])
+
+    def test_proxy_fallback_actually_passes_proxy(self):
+        """回归：旧代码拿到代理列表却没传 proxy=，等于继续直连重试。"""
+        site = self.FakeSite(lambda proxy: RuntimeError("直连失败") if proxy is None else
+                             (RuntimeError("代理1失败") if proxy == "1.1.1.1:80" else "ok"))
+        with mock.patch.object(wf, "proxies_from_pool", return_value=["1.1.1.1:80", "2.2.2.2:80"]):
+            self.assertEqual(wf.fetch_first_page(site, {}, use_proxy=True), "ok")
+        self.assertEqual(site.calls, [None, "1.1.1.1:80", "2.2.2.2:80"])
+
+    def test_no_proxy_available_reraises_direct_error(self):
+        site = self.FakeSite(lambda proxy: RuntimeError("直连失败"))
+        with mock.patch.object(wf, "proxies_from_pool", return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, "直连失败"):
+                wf.fetch_first_page(site, {}, use_proxy=True)
+
+
+class TestDisappearanceGuard(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="guard_")
+        self.db = os.path.join(self.tmp, "t.db")
+        self.conn = wf.init_db(self.db)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _seed_prev(self, query):
+        self.conn.execute("INSERT INTO snapshots (site,query) VALUES (?,?)",
+                          ("s", json.dumps(query, ensure_ascii=False)))
+        self.conn.commit()
+
+    def test_blocks_max_pages_truncation(self):
+        self._seed_prev({"a": "1"})
+        ok, why = wf.disappearance_guard(
+            self.conn, "s", {"a": "1"}, pages_known=True, failed_pages=[],
+            all_rows=10, total=10, max_pages=5)
+        self.assertFalse(ok)
+        self.assertIn("max-pages", why)
+
+    def test_blocks_when_pager_count_unknown(self):
+        self._seed_prev({"a": "1"})
+        ok, why = wf.disappearance_guard(
+            self.conn, "s", {"a": "1"}, pages_known=False, failed_pages=[],
+            all_rows=20, total=None, max_pages=0)
+        self.assertFalse(ok)
+        self.assertIn("分页总数未识别", why)
+
+    def test_blocks_when_rows_short_of_site_total(self):
+        self._seed_prev({"a": "1"})
+        ok, why = wf.disappearance_guard(
+            self.conn, "s", {"a": "1"}, pages_known=True, failed_pages=[],
+            all_rows=20, total=455, max_pages=0)
+        self.assertFalse(ok)
+        self.assertIn("结果集不完整", why)
+
+    def test_blocks_when_query_changed(self):
+        self._seed_prev({"ddl_qy": "RD001"})
+        ok, why = wf.disappearance_guard(
+            self.conn, "s", {"ddl_qy": "RD002"}, pages_known=True, failed_pages=[],
+            all_rows=10, total=10, max_pages=0)
+        self.assertFalse(ok)
+        self.assertIn("查询条件", why)
+
+    def test_allows_complete_result_with_same_query_any_order(self):
+        self.conn.execute("INSERT INTO snapshots (site,query) VALUES (?,?)",
+                          ("s", '{"b": "2", "a": "1"}'))
+        self.conn.commit()
+        ok, why = wf.disappearance_guard(
+            self.conn, "s", {"a": "1", "b": "2"}, pages_known=True, failed_pages=[],
+            all_rows=10, total=10, max_pages=0)
+        self.assertTrue(ok, why)
+
+    def test_first_run_without_snapshot_skips(self):
+        ok, why = wf.disappearance_guard(
+            self.conn, "s", {"a": "1"}, pages_known=True, failed_pages=[],
+            all_rows=10, total=10, max_pages=0)
+        self.assertFalse(ok)
+        self.assertIn("没有上一轮快照", why)
+
+
+class TestServeAggregates(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="serve_")
+        self.db = os.path.join(self.tmp, "t.db")
+        self.conn = wf.init_db(self.db)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _add_listing(self, key, loc, area, price, sold_at=None):
+        self.conn.execute(
+            "INSERT INTO listings (site,key_id,first_seen_at,last_seen_at,location,area,price,sold_at)"
+            " VALUES ('s',?,?,?,?,?,?,?)",
+            (key, "2026-01-01 00:00:00", "2026-01-01 00:00:00", loc, area, price, sold_at))
+        self.conn.commit()
+
+    def test_api_projects_aggregates_numbers(self):
+        self._add_listing("A1", "苏州工业园区某路1号甲苑1幢101", 140, 40000)
+        self._add_listing("A2", "苏州工业园区某路1号甲苑1幢102", 150, 41000)
+        self._add_listing("A3", "苏州工业园区某路1号甲苑1幢103", 160, 42000,
+                          sold_at="2026-01-02 00:00:00")
+        got = {p["project"]: p for p in serve.api_projects(self.conn)}["甲苑"]
+        self.assertEqual((got["alive"], got["sold"], got["total"]), (2, 1, 3))
+        self.assertEqual(got["avg_price"], 40500)
+        self.assertEqual(got["sell_rate"], 33.3)
+
+    def test_api_trend_filters_alive_zero_or_null_legacy_rows(self):
+        """alive=0/NULL 是 ALTER 补列的历史假值，画进曲线就是 455->0 假暴跌。"""
+        rows = [
+            ("2026-10-15 09:00:00", 0, 0, 100, 100, 100),
+            ("2026-10-16 09:00:00", None, 0, 100, 100, 100),
+            ("2026-10-17 09:00:00", 10, 1, 11, 11, 11),
+        ]
+        for t, alive, sold, total, fetched, dtot in rows:
+            self.conn.execute(
+                "INSERT INTO snapshots (site,taken_at,query,total,new,changed,sold,alive,fetched,dtot)"
+                " VALUES ('s',?,'{}',?,0,0,?,?,?,?)",
+                (t, total, sold, alive, fetched, dtot))
+        self.conn.commit()
+        out = serve.api_trend(self.conn, days=3650)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["alive"], 10)
+        self.assertEqual(out[0]["dataset_total"], 11)
+
+    def test_api_stats_sold_today_uses_beijing_date(self):
+        """UTC 前一天 16:00-24:00 对应北京时间今天， sold_today 不能按 UTC 日期算。"""
+        self._add_listing("B1", "乙苑1幢101", 100, 30000,
+                          sold_at="2026-01-02 00:30:00")   # 北京时间 1/2
+        self._add_listing("B2", "乙苑1幢102", 100, 30000,
+                          sold_at="2026-01-01 23:30:00")   # 北京时间 1/1
+        with mock.patch.object(serve, "now_cn", return_value=datetime(2026, 1, 2, 1, 0, 0)):
+            stats = serve.api_stats(self.conn)
+        self.assertEqual(stats["sold_today"], 1)
+
+
+class TestHttpApi(unittest.TestCase):
+    """HTTP 层参数校验：之前 days 非法值 500、delete 无 id 也 ok。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="http_")
+        self.db = os.path.join(self.tmp, "t.db")
+        wf.init_db(self.db).close()
+        self.old_db = serve.DB
+        serve.DB = self.db
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), serve.Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+        serve.DB = self.old_db
+
+    def _request(self, path, method="GET", body=None):
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read().decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "ignore")
+
+    def test_delete_subscription_without_id_is_400(self):
+        code, body = self._request("/api/subscriptions/delete", method="POST", body={})
+        self.assertEqual(code, 400)
+        self.assertIn("id", body)
+
+    def test_invalid_days_returns_400_not_500(self):
+        for path in ("/api/trend?days=abc", "/api/project?name=x&days=abc"):
+            code, body = self._request(path)
+            self.assertEqual(code, 400, path)
+            self.assertIn("days", body)
+
+    def test_unknown_route_is_404(self):
+        code, _ = self._request("/api/nope")
+        self.assertEqual(code, 404)
 
 
 if __name__ == "__main__":

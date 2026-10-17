@@ -114,11 +114,20 @@ def main():
         problems += fail("找不到 mergeSubs（订阅合并逻辑）")
     else:
         body = m.group(1)
-        if "MODE" in body and "return L" in body:
+        # 弱断言曾只查 "MODE" 和 "return L" 两个字符串，逻辑写反也能过。
+        # 必须看到精确守卫：静态模式（非 api）直接返回本地列表，不写 localStorage。
+        if re.search(r"if\(MODE !== 'api'\) return L;", body):
             problems += ok("mergeSubs 在静态模式下不污染 localStorage")
         else:
-            problems += fail("mergeSubs 缺少模式判断，静态托管下会把远端订阅"
-                             "注入 localStorage，导致删除的订阅复活")
+            problems += fail("mergeSubs 缺少精确静态守卫 if(MODE !== 'api') return L;"
+                             "（弱断言会让写反的逻辑假通过）")
+
+    # 6.5) 成交动态的 old/new 必须转义：接入带 status_field 的站点后，这两个值
+    #      来自站点页面，不转义就是存储型 XSS。
+    if "${esc(c.old)}→${esc(c.new)}" in src:
+        problems += ok("成交动态 old/new 已转义")
+    else:
+        problems += fail("loadChanges 渲染 c.old/c.new 未过 esc()（存储型 XSS 风险）")
 
     # 7) 拼音表语法（曾因漏逗号把整份 JS 写崩，所有测试全红）
     py = re.search(r"const PY = \{(.*?)\};", src, re.S)
@@ -127,6 +136,13 @@ def main():
     else:
         pairs = re.findall(r"'([^']+)'\s*:\s*'([^']+)'", py.group(1))
         raw = py.group(1)
+        # 重复 key：JS 对象后者覆盖前者（曾把 '尚' 先 s 后 z，拼音首字母全错）
+        keys = [k for k, _ in pairs]
+        dup = sorted({k for k in keys if keys.count(k) > 1})
+        if dup:
+            problems += fail(f"拼音表存在重复 key: {dup}（后者会覆盖前者）")
+        else:
+            problems += ok("拼音表无重复 key")
         # 检查是否有粘连的两个 key（漏逗号的典型症状：'z''筑'）
         sticky = re.search(r"'\)\s*'", raw)
         # 统计引号数：每个键值对 4 个引号，总数必须是 4 的倍数

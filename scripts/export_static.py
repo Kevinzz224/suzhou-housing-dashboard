@@ -25,7 +25,6 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -67,7 +66,7 @@ def build(db_path, days=30):
         changes = []
 
     payload = {
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_at": serve.now_cn().strftime("%Y-%m-%d %H:%M:%S"),
         "stats": serve.api_stats(conn),
         "projects": projects,
         "project_details": details,

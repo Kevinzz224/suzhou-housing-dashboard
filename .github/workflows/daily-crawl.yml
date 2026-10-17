@@ -96,12 +96,19 @@ jobs:
             echo "数据无变化，跳过提交"
           else
             git commit -m "chore(data): 每日更新 $(date -u +%Y-%m-%d)"
-            # 并发运行/上一次提交可能让 main 前进，先 rebase 再推，避免 non-fast-forward
+            # 并发运行/上一次提交可能让 main 前进，先 rebase 再推，避免 non-fast-forward。
+            # 必须显式记成功标志：循环最后一条命令是 sleep 时，即使 3 次 push 全失败，
+            # 步骤也会以退出码 0 结束（bash 吞掉 && 链失败），导致数据只 commit 未 push。
+            ok=0
             for i in 1 2 3; do
-              git pull --rebase --autostash origin main && git push && break
+              if git pull --rebase --autostash origin main && git push; then
+                ok=1
+                break
+              fi
               echo "第 $i 次推送失败，重试..."
               sleep 5
             done
+            [ "$ok" = 1 ] || { echo "连续 3 次推送失败，本次数据未上传"; exit 1; }
           fi
 
       - name: 报告跳过原因

@@ -15,7 +15,7 @@
     GET  /api/stats            -> 总览
 
 设计要点:
-- http.server 单线程足够（本地小工具，前端轮询）
+- ThreadingHTTPServer 并发处理请求；每请求独立 SQLite 连接，避免串库
 - 全部参数化 SQL，无注入面
 - JSON 响应统一带 Access-Control-Allow-Origin: *（方便本地调试）
 """
@@ -25,11 +25,34 @@ import os
 import re
 import sqlite3
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB = None
+
+
+def now_cn():
+    """统一的北京时间（UTC+8），返回 naive datetime 便于和库存时间字符串比较。
+
+    Actions runner 是 UTC、本地是 UTC+8；sold_at/snapshots 都按北京时间落库，
+    统计「今天 / 最近 N 天」也必须用同一个时区，否则会偏 8 小时。
+    """
+    return datetime.now(timezone.utc).astimezone(
+        timezone(timedelta(hours=8))).replace(tzinfo=None)
+
+
+def parse_days(value, default=30):
+    """解析 days 参数：非法值抛 ValueError，由 HTTP 层转成 400 而不是 500。"""
+    if value in (None, ""):
+        return default
+    try:
+        d = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("days 必须是正整数")
+    if d <= 0:
+        raise ValueError("days 必须是正整数")
+    return d
 
 
 def project_of(location):
@@ -131,7 +154,7 @@ def project_snapshots(conn, project, days=30):
 
     为什么不用 snapshots.alive：那是全站数字，直接画到项目页会串数据。
     """
-    now = datetime.now()
+    now = now_cn()
     cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%d")
     times = [r["taken_at"] for r in
              q(conn, "SELECT DISTINCT taken_at FROM snapshots ORDER BY taken_at")
@@ -161,7 +184,7 @@ def api_project(conn, name, days=30):
     rows = [r for r in rows if project_of(r.get("location")) == name]
     if not rows:
         return None
-    now = datetime.now()
+    now = now_cn()
 
     def within(r, d, field):
         v = r.get(field)
@@ -244,7 +267,7 @@ def api_trend(conn, days=30):
     填的默认值是 0，直接画会让曲线突然掉到 0（表现为"455 -> 0"的假暴跌）。
     历史行没有可用的在售数，只能剔除；宁可曲线短一点也不画假数据。
     """
-    now = datetime.now()
+    now = now_cn()
     cols = _table_cols(conn, "snapshots")
     has_new = "fetched" in cols and "dtot" in cols
     sel = ("taken_at, alive, sold, total, fetched, dtot" if has_new
@@ -276,7 +299,7 @@ def api_stats(conn):
     if len(snaps) >= 2:
         delta = {"alive": snaps[0]["alive"] - snaps[1]["alive"],
                  "sold": snaps[0]["sold"] - snaps[1]["sold"]}
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_cn().strftime("%Y-%m-%d")
     sold_today = conn.execute(
         "SELECT COUNT(*) FROM listings WHERE sold_at LIKE ?", (today + "%",)).fetchone()[0]
     return {"alive": alive, "sold": sold, "total": total, "last_crawl": last,
@@ -331,11 +354,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(api_projects(conn, one("site")))
             if path == "/api/project":
                 name = one("name", "")
-                days = int(one("days", "30") or 30)
+                days = parse_days(one("days", "30"))
                 data = api_project(conn, name, days)
                 return self._json(data if data else {"error": "项目不存在"}, 404 if not data else 200)
             if path == "/api/trend":
-                return self._json(api_trend(conn, int(one("days", "30") or 30)))
+                return self._json(api_trend(conn, parse_days(one("days", "30"))))
             if path == "/api/changes":
                 rows = q(conn, """SELECT sc.*, l.location FROM status_changes sc
                     LEFT JOIN listings l ON l.site=sc.site AND l.key_id=sc.key_id
@@ -347,6 +370,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/stats":
                 return self._json(api_stats(conn))
             self.send_error(404)
+        except ValueError as e:
+            self._json({"error": str(e)}, 400)
         except Exception as e:
             self._json({"error": str(e)}, 500)
         finally:
@@ -364,15 +389,20 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute(
                     "INSERT INTO subscriptions (site, keyword, note, created_at) VALUES (?,?,?,?)",
                     ("suzhou-cansale", kw, (body.get("note") or "").strip(),
-                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                     now_cn().strftime("%Y-%m-%d %H:%M:%S")))
                 conn.commit()
                 return self._json({"ok": True})
             if u.path == "/api/subscriptions/delete":
                 body = self._body_json()
-                conn.execute("UPDATE subscriptions SET active=0 WHERE id=?", (body.get("id"),))
+                sid = body.get("id")
+                if sid in (None, ""):
+                    return self._json({"error": "id 不能为空"}, 400)
+                conn.execute("UPDATE subscriptions SET active=0 WHERE id=?", (sid,))
                 conn.commit()
                 return self._json({"ok": True})
             self.send_error(404)
+        except ValueError as e:
+            self._json({"error": str(e)}, 400)
         except Exception as e:
             self._json({"error": str(e)}, 500)
         finally:
