@@ -722,6 +722,49 @@ class DashboardE2E(BrowserBase):
             self.cdp.eval("document.querySelector('#crawlBtn').textContent.includes('抓取中')"),
             "取消后不应进入抓取态")
 
+    def test_84_network_failure_is_not_reported_as_token_error(self):
+        """api.github.com 不可达时必须说「网络不通」，绝不能报「Token 无效」。
+
+        两者处置方式完全不同：一个是网络/代理问题，一个是重新签发 token。
+        报错了，用户会反复重填 token 却永远好不了。
+        """
+        self.cdp.eval("localStorage.setItem('gh_pat_v1','github_pat_fake_for_test')")
+        self.cdp.eval(
+            "window.__realFetch = window.fetch;"
+            " window.fetch = function(){ return Promise.reject("
+            "new TypeError('Failed to fetch')); };")
+        try:
+            self.cdp.eval("triggerCrawl()")
+            self.wait_for(
+                "document.querySelector('#crawlStatus').textContent.length > 0",
+                timeout=10)
+            txt = self.cdp.eval("document.querySelector('#crawlStatus').textContent")
+            self.assertIn("网络不通", txt, f"网络失败应提示网络问题，实际={txt!r}")
+            self.assertNotIn("Token", txt, f"网络失败不能甩锅给 token，实际={txt!r}")
+            self.assertNotEqual(
+                self.cdp.eval(
+                    "getComputedStyle(document.querySelector('#actionsLink')).display"),
+                "none", "失败时必须给出兜底入口（.h-sub 是 flex，inline 会被 blockify 成 block）")
+        finally:
+            self.cdp.eval("window.fetch = window.__realFetch")
+
+    def test_85_trend_delta_label_includes_days(self):
+        """存量趋势的差值必须带天数（「近4天 -2 套」），不能只写「-2 套」。
+
+        只写数字会被读成当天暴跌 —— 用户已经当成 bug 报过两次。
+        """
+        self.cdp.eval(
+            "openDetail(document.querySelector('#projects .card').dataset.p)")
+        self.wait_for(
+            "document.querySelector('#detailView').style.display === 'block'",
+            timeout=10)
+        lbl = self.cdp.eval(
+            "(() => { const t=document.querySelector('#detailView svg text');"
+            " return t ? t.textContent : null; })()")
+        self.assertIsNotNone(lbl, "详情页应有趋势图")
+        self.assertIn("近", lbl, f"差值标签要说明时间跨度，实际={lbl!r}")
+        self.assertIn("天", lbl, f"差值标签要带天数，实际={lbl!r}")
+
     def test_83_page_embeds_no_real_token(self):
         """页面源码里绝不能出现真实 token —— 公开仓库等于全世界可读。
 

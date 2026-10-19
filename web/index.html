@@ -28,6 +28,9 @@ header{position:sticky;top:0;z-index:50;background:rgba(11,17,32,.92);backdrop-f
 .crawl-status{font-size:10px;color:var(--mut)}
 .crawl-status.ok{color:var(--dn)}
 .crawl-status.err{color:var(--up)}
+/* 触发失败时的兜底入口：api.github.com 在部分网络下不可达，但网页版 Actions 通常能开 */
+.crawl-link{display:none;font-size:10px;color:var(--acc);text-decoration:none;border-bottom:1px dotted var(--acc)}
+.crawl-link:hover{opacity:.8}
 /* 一次性 token 输入弹层 */
 .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;
   align-items:center;justify-content:center;z-index:200;padding:20px}
@@ -139,6 +142,8 @@ td.r,th.r{text-align:right}
     <span id="snapinfo"></span>
     <button class="crawl-btn" id="crawlBtn" title="立即触发一次云端抓取（不需要改动仓库）">⟳ 手动抓取</button>
     <span id="crawlStatus" class="crawl-status"></span>
+    <a id="actionsLink" class="crawl-link" target="_blank" rel="noopener"
+       href="https://github.com/Kevinzz224/suzhou-housing-dashboard/actions/workflows/daily-crawl.yml">去 Actions 手动跑 →</a>
   </div>
 </header>
 
@@ -376,11 +381,16 @@ function sparkline(snaps){
   }).join(' ');
   const last=vals[vals.length-1], first=vals[0], diff=last-first;
   const color=diff>0?'var(--dn)':(diff<0?'var(--up)':'var(--mut)');
+  // 差值必须标明「跨了多少天」。之前只写 "-2 套"，看着像当天暴跌，
+  // 实际是首点到末点的累计变化（用户两次当成 bug 报）。
+  const d0=new Date(snaps[0].date+'T00:00:00'), d1=new Date(snaps[snaps.length-1].date+'T00:00:00');
+  const days=Math.max(1, Math.round((d1-d0)/86400000));
+  const diffLabel = diff===0 ? `近${days}天 持平` : `近${days}天 ${diff>0?'+':''}${diff} 套`;
   const area=`${pad},${h-pad} ${pts} ${w-pad},${h-pad}`;
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
     <polygon points="${area}" fill="rgba(79,140,255,.13)"/>
     <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.8" stroke-linejoin="round"/>
-    <text x="2" y="11" fill="${color}" font-size="10">${diff>0?'+':''}${diff} 套</text>
+    <text x="2" y="11" fill="${color}" font-size="10">${diffLabel}</text>
     <text x="${w-2}" y="11" fill="var(--mut)" font-size="9" text-anchor="end">${snaps[0].date.slice(5)} → ${snaps[snaps.length-1].date.slice(5)}</text>
   </svg>`;
 }
@@ -700,14 +710,25 @@ async function triggerCrawl(){
   const btn=$('#crawlBtn'), t0=Date.now();
   crawlBusy=true; btn.disabled=true; btn.classList.add('busy'); btn.textContent='⟳ 抓取中';
   setStatus('正在触发…');
+  const lk0=$('#actionsLink'); if(lk0) lk0.style.display='none';
   try{
     let before='';
     try{ before=(await (await fetch('data.json?t='+Date.now())).json()).generated_at||''; }catch(e){}
-    const r = await ghFetch(`/repos/${GH.repo}/actions/workflows/${GH.wf}/dispatches`, pat, {
-      method:'POST',
-      headers:{ 'Authorization':'Bearer '+pat, 'Accept':'application/vnd.github+json', 'Content-Type':'application/json' },
-      body: JSON.stringify({ref:'main', inputs:{force:'true'}})
-    });
+    let r;
+    try{
+      r = await ghFetch(`/repos/${GH.repo}/actions/workflows/${GH.wf}/dispatches`, pat, {
+        method:'POST',
+        headers:{ 'Authorization':'Bearer '+pat, 'Accept':'application/vnd.github+json', 'Content-Type':'application/json' },
+        body: JSON.stringify({ref:'main', inputs:{force:'true'}})
+      });
+    }catch(netErr){
+      // TypeError: Failed to fetch == 请求根本没发出去（被墙 / 代理拦 OPTIONS /
+      // 浏览器扩展拦截 / 离线）。这跟权限无关，绝不能提示"token 无效"，
+      // 否则用户会反复重填 token 却永远好不了。
+      const why = (typeof navigator!=='undefined' && navigator.onLine===false)
+        ? '设备当前离线' : '浏览器连不上 api.github.com（被墙/代理拦截/扩展阻止）';
+      throw new Error('网络不通：' + why);
+    }
     if(r.status===401||r.status===403){ patSet(''); throw new Error('Token 无效或无权限（需 Actions: Read and write）'); }
     if(r.status===404){ throw new Error('仓库或 workflow 不存在'); }
     if(r.status!==204){ throw new Error('触发失败 HTTP '+r.status); }
@@ -723,6 +744,8 @@ async function triggerCrawl(){
     toast('抓取完成，数据已更新');
   }catch(e){
     setStatus('✗ '+(e && e.message || e), 'err');
+    // 兜底入口：网页版 Actions 只要 github.com 能打开就能跑
+    const lk=$('#actionsLink'); if(lk) lk.style.display='inline';
   }finally{
     crawlBusy=false; btn.disabled=false; btn.classList.remove('busy'); btn.textContent='⟳ 手动抓取';
   }
