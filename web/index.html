@@ -17,7 +17,35 @@ header{position:sticky;top:0;z-index:50;background:rgba(11,17,32,.92);backdrop-f
 .h-title{display:flex;align-items:baseline;gap:8px}
 .h-title h1{font-size:18px;font-weight:700;letter-spacing:.5px}
 .h-title span{font-size:11px;color:var(--mut)}
-.h-sub{margin-top:6px;font-size:11px;color:var(--mut);display:flex;gap:10px;flex-wrap:wrap}
+.h-sub{margin-top:6px;font-size:11px;color:var(--mut);display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+/* 手动抓取按钮：静态托管没有后端，点击后调 GitHub Actions API 触发一次抓取 */
+.crawl-btn{background:var(--card);border:1px solid var(--acc);color:var(--acc);
+  border-radius:14px;padding:3px 10px;font-size:11px;cursor:pointer;transition:.15s;
+  font-family:inherit}
+.crawl-btn:hover:not(:disabled){background:var(--acc);color:#fff}
+.crawl-btn:disabled{opacity:.5;cursor:default;border-color:var(--line);color:var(--mut)}
+.crawl-btn.busy{border-color:var(--gold);color:var(--gold)}
+.crawl-status{font-size:10px;color:var(--mut)}
+.crawl-status.ok{color:var(--dn)}
+.crawl-status.err{color:var(--up)}
+/* 一次性 token 输入弹层 */
+.modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;
+  align-items:center;justify-content:center;z-index:200;padding:20px}
+.modal-mask.on{display:flex}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:14px;
+  padding:16px;max-width:420px;width:100%}
+.modal h3{font-size:14px;margin-bottom:8px}
+.modal p{font-size:11px;color:var(--mut);line-height:1.6;margin-bottom:10px}
+.modal input{width:100%;background:var(--card2);border:1px solid var(--border);
+  color:var(--tx);border-radius:9px;padding:9px 11px;font-size:13px;outline:none;
+  font-family:monospace}
+.modal input:focus{border-color:var(--acc)}
+.modal .row{display:flex;gap:8px;margin-top:12px}
+.modal button{flex:1;border-radius:9px;padding:9px;font-size:13px;cursor:pointer;
+  border:1px solid var(--border);background:var(--card2);color:var(--tx);font-family:inherit}
+.modal button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.modal code{background:var(--card2);padding:1px 5px;border-radius:5px;font-size:10px}
+.modal a{color:var(--acc)}
 .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dn);margin-right:4px;vertical-align:middle}
 .wrap{padding:12px 12px 0;max-width:720px;margin:0 auto}
 /* 统计卡 */
@@ -109,6 +137,8 @@ td.r,th.r{text-align:right}
   <div class="h-sub">
     <span><i class="dot"></i>数据源：苏州住建局</span>
     <span id="snapinfo"></span>
+    <button class="crawl-btn" id="crawlBtn" title="立即触发一次云端抓取（不需要改动仓库）">⟳ 手动抓取</button>
+    <span id="crawlStatus" class="crawl-status"></span>
   </div>
 </header>
 
@@ -581,6 +611,124 @@ document.querySelector('.h-sub').innerHTML+=
   '<span style="color:var(--acc);cursor:pointer;padding:2px 4px" onclick="go(\'sub\')">📌 订阅</span>'+
   '<span style="color:var(--mut);cursor:pointer;padding:2px 4px" onclick="go(\'list\')">🏠 主页</span>';
 
+// ── 手动抓取：静态站的"后端"就是 GitHub Actions ──────────
+// 页面没有服务器，所以按钮直接调 GitHub REST API 触发 workflow_dispatch。
+// token 由用户自己粘贴、存在本机 localStorage —— 绝不写进仓库：
+// 公开仓库里放 token 等于公开给全世界，任何人可读。
+const GH = {repo:'Kevinzz224/suzhou-housing-dashboard', wf:'daily-crawl.yml'};
+const PAT_KEY = 'gh_pat_v1';
+let crawlBusy = false;
+
+function patGet(){ try{return localStorage.getItem(PAT_KEY)||''}catch(e){return ''} }
+function patSet(v){ try{ v?localStorage.setItem(PAT_KEY,v):localStorage.removeItem(PAT_KEY) }catch(e){} }
+function setStatus(t,c){ const el=$('#crawlStatus'); if(!el)return; el.textContent=t||''; el.className='crawl-status'+(c?' '+c:''); }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+// 首次使用弹一次 token 输入，之后一直复用（可随时清 localStorage 重置）
+function askToken(){
+  return new Promise(resolve=>{
+    const mask=$('#patMask'), inp=$('#patInput');
+    mask.classList.add('on'); inp.value='';
+    setTimeout(()=>inp.focus(),50);
+    const done=v=>{
+      mask.classList.remove('on');
+      $('#patOk').onclick=null; $('#patCancel').onclick=null; inp.onkeydown=null;
+      resolve(v);
+    };
+    $('#patOk').onclick=()=>done(inp.value.trim());
+    $('#patCancel').onclick=()=>done('');
+    inp.onkeydown=e=>{ if(e.key==='Enter') done(inp.value.trim()); };
+  });
+}
+
+function ghFetch(path, pat, extra){
+  const base={ 'Authorization':'Bearer '+pat, 'Accept':'application/vnd.github+json' };
+  return fetch('https://api.github.com'+path, Object.assign({headers:base}, extra||{}));
+}
+
+// dispatch 接口不返回 run id，只能按创建时间反查（留 90s 容差吸收时钟偏差）
+async function findRun(pat, since){
+  for(let i=0;i<20;i++){
+    const r = await ghFetch(`/repos/${GH.repo}/actions/workflows/${GH.wf}/runs?event=workflow_dispatch&per_page=5`, pat);
+    if(r.ok){
+      const d = await r.json();
+      const hit = (d.workflow_runs||[]).find(x=>new Date(x.created_at).getTime() >= since-90000);
+      if(hit) return hit;
+    }
+    await sleep(3000);
+  }
+  return null;
+}
+
+async function waitRunDone(pat, id){
+  for(let i=0;i<100;i++){
+    const r = await ghFetch(`/repos/${GH.repo}/actions/runs/${id}`, pat);
+    if(r.ok){
+      const d = await r.json();
+      if(d.status==='completed') return d.conclusion;
+      setStatus(d.status==='queued' ? '排队中…' : '抓取中…');
+    }
+    await sleep(4000);
+  }
+  return 'timeout';
+}
+
+// 抓完到 Pages 生效有 30~90s 延迟，轮询 generated_at 变化才算真的更新了
+async function waitDataFresh(before){
+  for(let i=0;i<40;i++){
+    try{
+      const r = await fetch('data.json?t='+Date.now());
+      if(r.ok){
+        const d = await r.json();
+        if(d.generated_at && d.generated_at !== before) return true;
+      }
+    }catch(e){}
+    setStatus('等待部署生效…');
+    await sleep(6000);
+  }
+  return false;
+}
+
+async function triggerCrawl(){
+  if(crawlBusy) return;
+  let pat = patGet();
+  if(!pat){
+    pat = await askToken();
+    if(!pat){ setStatus('已取消'); return; }
+    patSet(pat);
+  }
+  const btn=$('#crawlBtn'), t0=Date.now();
+  crawlBusy=true; btn.disabled=true; btn.classList.add('busy'); btn.textContent='⟳ 抓取中';
+  setStatus('正在触发…');
+  try{
+    let before='';
+    try{ before=(await (await fetch('data.json?t='+Date.now())).json()).generated_at||''; }catch(e){}
+    const r = await ghFetch(`/repos/${GH.repo}/actions/workflows/${GH.wf}/dispatches`, pat, {
+      method:'POST',
+      headers:{ 'Authorization':'Bearer '+pat, 'Accept':'application/vnd.github+json', 'Content-Type':'application/json' },
+      body: JSON.stringify({ref:'main', inputs:{force:'true'}})
+    });
+    if(r.status===401||r.status===403){ patSet(''); throw new Error('Token 无效或无权限（需 Actions: Read and write）'); }
+    if(r.status===404){ throw new Error('仓库或 workflow 不存在'); }
+    if(r.status!==204){ throw new Error('触发失败 HTTP '+r.status); }
+    setStatus('已触发，等待排队…');
+    const run = await findRun(pat, t0);
+    if(!run) throw new Error('没找到本次运行，请到 Actions 页确认');
+    const concl = await waitRunDone(pat, run.id);
+    if(concl!=='success') throw new Error('抓取结束：'+concl);
+    setStatus('抓取完成，等待部署…');
+    await waitDataFresh(before);
+    await load();
+    setStatus('✓ 已更新', 'ok');
+    toast('抓取完成，数据已更新');
+  }catch(e){
+    setStatus('✗ '+(e && e.message || e), 'err');
+  }finally{
+    crawlBusy=false; btn.disabled=false; btn.classList.remove('busy'); btn.textContent='⟳ 手动抓取';
+  }
+}
+$('#crawlBtn').addEventListener('click', triggerCrawl);
+
 // ── 测试钩子（E2E 用，不影响 UI）─────────────────────
 window.D_STATS_ALIVE = () => (CACHE && CACHE.stats && CACHE.stats.alive) || 0;
 window.D_CACHE = () => CACHE;
@@ -588,5 +736,21 @@ window.D_CACHE = () => CACHE;
 load();
 setInterval(load, 60000);
 </script>
+
+<!-- 一次性 token 输入（只存本机 localStorage，不进仓库） -->
+<div class="modal-mask" id="patMask">
+  <div class="modal">
+    <h3>🔑 需要一个 GitHub Token</h3>
+    <p>页面是静态托管（没服务器），「手动抓取」由浏览器直接调 GitHub Actions 触发云端爬取。</p>
+    <p>去 <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">创建 Fine-grained token</a>，
+       仅授权本仓库的 <code>Actions: Read and write</code>，然后粘到下面。</p>
+    <p style="color:var(--acc)">Token 只保存在这台设备的浏览器里，不会提交进仓库、也不经过任何第三方。</p>
+    <input id="patInput" type="password" placeholder="github_pat_..." autocomplete="off">
+    <div class="row">
+      <button id="patCancel">取消</button>
+      <button class="primary" id="patOk">保存并抓取</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>

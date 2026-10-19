@@ -21,7 +21,8 @@ ROOT = os.path.abspath(os.path.join(HERE, ".."))
 HTML_PATH = os.path.join(ROOT, "web", "index.html")
 
 REQUIRED_IDS = ["projects", "listView", "detailView", "subView", "subs",
-                "kwInput", "tabs", "stats", "changes", "toast"]
+                "kwInput", "tabs", "stats", "changes", "toast",
+                "crawlBtn", "crawlStatus", "patMask", "patInput"]
 
 
 def fail(msg):
@@ -190,6 +191,30 @@ def main():
         problems += ok("存在 __errs 错误收集钩子")
     else:
         problems += fail("缺少 __errs 钩子（E2E 无法断言无 JS 错误）")
+
+    # ── 手动抓取按钮（静态站没有后端，靠浏览器调 GitHub Actions）──
+    # 这几条防的是"功能看着在、实际打不通"和"把 token 写进公开仓库"。
+    if "dispatches" in src and "daily-crawl.yml" in src:
+        problems += ok("手动抓取走 workflow_dispatch 接口")
+    else:
+        problems += fail("缺少 workflow_dispatch 触发逻辑")
+
+    if re.search(r"inputs\s*:\s*\{\s*force\s*:\s*['\"]true['\"]", src):
+        problems += ok("手动抓取带 force=true（绕过「今天已抓」守卫）")
+    else:
+        problems += fail("手动抓取必须传 force=true，否则当天抓过就什么都不做")
+
+    if re.search(r"localStorage\.(get|set)Item\(\s*PAT_KEY", src):
+        problems += ok("token 只存本机 localStorage")
+    else:
+        problems += fail("token 必须存 localStorage")
+
+    # 公开仓库里出现真实 token 等于泄露给全世界 —— 这条必须是硬门禁
+    leaked = re.search(r"(github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{30,})", src)
+    if leaked:
+        problems += fail(f"页面内嵌了疑似真实 token：{leaked.group(0)[:12]}…")
+    else:
+        problems += ok("页面未内嵌任何 token")
 
     print()
     if problems:

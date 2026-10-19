@@ -17,6 +17,7 @@
 import base64
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -203,11 +204,28 @@ class BrowserBase(unittest.TestCase):
                 f"Chromium 未启动（binary={cls.chrome}, rc={cls.proc.poll()}）\n"
                 f"--- chrome 日志 ---\n{log}")
 
-        # 拿页面 target
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{cls.cdp_port}/json", timeout=10) as r:
-            targets = json.load(r)
-        page = next(t for t in targets if t["type"] == "page")
+        # 拿页面 target。Chromium 刚启动时 /json 里可能还没有 page（尤其在
+        # 机器上已有其它 chrome 实例、启动偏慢时），单次 next() 会直接
+        # StopIteration —— 这是脚手架竞态，不是被测代码的问题，必须轮询等。
+        page = None
+        targets = []
+        for _ in range(40):
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{cls.cdp_port}/json", timeout=10) as r:
+                    targets = json.load(r)
+            except Exception:
+                targets = []
+            page = next((t for t in targets if t.get("type") == "page"), None)
+            if page:
+                break
+            if cls.proc.poll() is not None:
+                break
+            time.sleep(0.25)
+        if not page:
+            raise RuntimeError(
+                f"Chromium 没有 page target（rc={cls.proc.poll()}，"
+                f"targets={[t.get('type') for t in targets]}）")
         cls.cdp = CDPClient(page["webSocketDebuggerUrl"])
         cls.cdp.call("Page.enable")
         cls.cdp.call("Runtime.enable")
@@ -651,6 +669,69 @@ class DashboardE2E(BrowserBase):
         self.wait_for("typeof window.go === 'function'")
         self.wait_for("Array.isArray(SUBS) && SUBS.length > 0", timeout=15)
         self.assertEqual(self.cdp.eval("localSubs()[0].keyword"), "持久化盘")
+
+    # ── 手动抓取按钮（静态站的"后端"= GitHub Actions）────────
+    def test_80_crawl_button_visible(self):
+        """按钮必须在页面上真实可见可点，而不是只有 DOM 节点。"""
+        rect = self.cdp.eval(
+            "(() => { const b=document.querySelector('#crawlBtn');"
+            " if(!b) return null;"
+            " const r=b.getBoundingClientRect();"
+            " return {w:r.width,h:r.height,dis:b.disabled}; })()")
+        self.assertIsNotNone(rect, "缺少 #crawlBtn")
+        self.assertGreater(rect["w"], 0, "按钮宽度为 0（不可见）")
+        self.assertGreater(rect["h"], 0, "按钮高度为 0（不可见）")
+        self.assertFalse(rect["dis"], "按钮不应默认禁用")
+
+    def test_81_click_without_token_opens_modal(self):
+        """没有 token 时点击必须弹输入层，不能静默失败或直接报错。"""
+        self.cdp.eval("localStorage.removeItem('gh_pat_v1')")
+        self.cdp.eval("document.querySelector('#crawlBtn').click()")
+        self.wait_for(
+            "document.querySelector('#patMask').classList.contains('on')",
+            timeout=5)
+        self.assertTrue(
+            self.cdp.eval("document.querySelector('#patMask').classList.contains('on')"),
+            "首次点击应弹 token 输入层")
+
+    def test_82_cancel_closes_modal_without_triggering(self):
+        """取消后弹层要关、状态要提示已取消，且不能真的发起抓取。
+
+        注意：setUp 每个用例都会 localStorage.clear() + 重新导航，
+        所以本用例必须自己先把弹层打开（不能依赖上一个用例的遗留状态）。
+        """
+        self.cdp.eval("localStorage.removeItem('gh_pat_v1')")
+        self.cdp.eval("document.querySelector('#crawlBtn').click()")
+        self.wait_for(
+            "document.querySelector('#patMask').classList.contains('on')", timeout=5)
+
+        self.cdp.eval("document.querySelector('#patCancel').click()")
+        self.wait_for(
+            "!document.querySelector('#patMask').classList.contains('on')", timeout=5)
+        # 状态文本由 promise 续体异步写入，等它出现而不是立刻断言
+        self.wait_for(
+            "document.querySelector('#crawlStatus').textContent.includes('取消')",
+            timeout=5)
+        self.assertIn("取消",
+                      self.cdp.eval("document.querySelector('#crawlStatus').textContent"))
+        self.assertFalse(
+            self.cdp.eval("document.querySelector('#crawlBtn').disabled"),
+            "取消后按钮必须恢复可用")
+        # 没给 token 就绝不能真的发起抓取
+        self.assertFalse(
+            self.cdp.eval("document.querySelector('#crawlBtn').textContent.includes('抓取中')"),
+            "取消后不应进入抓取态")
+
+    def test_83_page_embeds_no_real_token(self):
+        """页面源码里绝不能出现真实 token —— 公开仓库等于全世界可读。
+
+        这条是安全红线：一旦有人图省事把 token 写进 HTML，
+        等于把仓库写权限公开。必须由门禁而不是自觉来守。
+        """
+        src = open(os.path.join(WEB, "index.html"), encoding="utf-8").read()
+        for pat in (r"github_pat_[A-Za-z0-9_]{20,}", r"ghp_[A-Za-z0-9]{30,}"):
+            self.assertIsNone(re.search(pat, src),
+                              f"页面内嵌了疑似真实 token（{pat}）")
 
 
 class ApiModeE2E(BrowserBase):
