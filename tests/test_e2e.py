@@ -648,11 +648,15 @@ class DashboardE2E(BrowserBase):
     # ── 数据正确性 ────────────────────────────────────
 
     def test_50_no_alive_zero_in_trend(self):
-        """历史坏快照（alive=0）不能画进曲线 —— 否则出现 455->0 的假暴跌。"""
+        """历史坏快照（alive=0）不能画进全局趋势曲线 —— 否则出现 455->0 的假暴跌。"""
         bad = self.cdp.eval(
-            "Object.values(CACHE.project_details).reduce((n,d)=>"
-            "n+(d.snapshots||[]).filter(s=>!s.alive).length,0)")
+            "(CACHE.trend||[]).filter(s=>s.alive<=0).length")
         self.assertEqual(bad, 0)
+        # 在售项目（d.alive > 0）的快照点也不能有 alive <= 0 的坏点
+        active_bad = self.cdp.eval(
+            "Object.values(CACHE.project_details).filter(d=>d.alive>0).reduce((n,d)=>"
+            "n+(d.snapshots||[]).filter(s=>s.alive<=0).length,0)")
+        self.assertEqual(active_bad, 0)
 
     def test_51_aliases_displayed(self):
         """推广名要显示，且备案名以副标题形式保留。"""
