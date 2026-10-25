@@ -902,8 +902,10 @@ class TestRealDataIntegrity(unittest.TestCase):
                          p["stats"]["alive"] + p["stats"]["sold"])
 
     def test_no_alive_zero_project(self):
-        zeros = [x["project"] for x in self.payload["projects"] if x["alive"] == 0]
-        self.assertEqual(zeros, [], f"出现 alive=0 的坏点: {zeros}")
+        """项目在售数不能为负；若在售为 0，必须是全部售罄（sold == total）。"""
+        bad = [x["project"] for x in self.payload["projects"]
+               if x["alive"] < 0 or (x["alive"] == 0 and x["sold"] != x["total"])]
+        self.assertEqual(bad, [], f"出现 alive 非法或未售罄却为 0 的坏点: {bad}")
 
     def test_detail_coverage_and_display_names(self):
         p = self.payload
