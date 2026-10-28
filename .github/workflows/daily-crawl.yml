@@ -41,9 +41,11 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 补跑守卫：今天已经「完整」抓过才跳过。
-      # 判据必须含完整性（fetched >= dtot > 0）——只判日期的话，09:07 那档若
+      # 补跑守卫：今天「所有查询」都完整跑过才跳过。
+      # 判据必须含完整性（fetched >= dtot）——只判日期的话，09:07 那档若
       # 抓一半崩了仍会写快照，后面三档全被跳过，当天数据永久缺页且不自愈。
+      # 有了第二条查询（珺华赋大户型）后，「最后一条快照完整」也不够：
+      # 主查询失败但大户型成功，照样会误判成今天已抓完，所以按查询条数判。
       # force=true（手动触发）可强制重抓。
       - name: 检查今天是否已抓取
         id: guard
@@ -51,50 +53,46 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
-          import sqlite3, os, sys
+          import json, sqlite3, os, sys
           from datetime import datetime, timezone, timedelta
           today = datetime.now(timezone.utc).astimezone(
               timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
           force = str(os.environ.get("FORCE", "")).strip().lower() == "true"
+          try:
+              cfg = json.load(open("scripts/queries.json", encoding="utf-8"))
+              need = len(cfg.get("queries") or [])
+          except Exception as e:
+              print(f"# 读 queries.json 失败（按 1 条算）: {e}", file=sys.stderr)
+              need = 1
           db = "data/housing.db"
-          last = fetched = dtot = None
+          got = set()
           if os.path.exists(db):
               try:
                   c = sqlite3.connect(db)
-                  row = c.execute(
-                      "SELECT taken_at, fetched, dtot FROM snapshots "
-                      "ORDER BY taken_at DESC LIMIT 1").fetchone()
-                  if row:
-                      last, fetched, dtot = row
+                  rows = c.execute(
+                      "SELECT query, fetched, dtot FROM snapshots "
+                      "WHERE taken_at LIKE ?", (today + "%",)).fetchall()
                   c.close()
+                  for q, f, d in rows:
+                      if f is None or d is None:
+                          continue
+                      # d>0：必须抓满；d==0：只有一条都没抓到才算真的空
+                      if f >= d and (d > 0 or f == 0):
+                          got.add(q)
               except Exception as e:
                   print(f"# 读库失败（将照常抓取）: {e}", file=sys.stderr)
-          same_day = bool(last and last[:10] == today)
-          # 完整性：抓到行数必须覆盖站点报的总条数（两列都有值且 >0）
-          complete = bool(fetched and dtot and dtot > 0 and fetched >= dtot)
-          done = same_day and complete and not force
-          print(f"# 今天={today} 最后快照={last} fetched={fetched} dtot={dtot} "
-                f"同日={same_day} 完整={complete} force={force}", file=sys.stderr)
+          done = len(got) >= need and not force
+          print(f"# 今天={today} 需要查询={need} 已完成={len(got)} force={force}",
+                file=sys.stderr)
           print(f"done={'true' if done else 'false'}")
           PY
 
       # 零第三方依赖：只用标准库，不需要 pip install
+      # 查询集合在 scripts/queries.json 里（园区 140-180 + 珺华赋 180+大户型）
       - name: 抓取数据
         if: steps.guard.outputs.done != 'true'
         run: |
-          python scripts/webforms_crawl.py \
-            --site scripts/sites/suzhou.json \
-            --db data/housing.db \
-            --param ddl_qy=RD002 \
-            --param txt_Area1=140 \
-            --param txt_Area2=180 \
-            --param ddl_houseclass=1 \
-            --param rb_HF_CODE=-1 \
-            --param txt_Pro= \
-            --param txt_Com= \
-            --param txt_Price1= \
-            --param txt_Price2= \
-            --interval 1.2
+          python scripts/run_queries.py --db data/housing.db --interval 1.2
 
       - name: 导出静态 JSON
         if: steps.guard.outputs.done != 'true'

@@ -8,6 +8,7 @@
 
 跑法: python tests/test_workflow_guard.py
 """
+import json
 import os
 import re
 import shutil
@@ -42,11 +43,20 @@ class TestWorkflowGuard(unittest.TestCase):
         os.makedirs(os.path.join(self.tmp, "data"), exist_ok=True)
         self.db = os.path.join(self.tmp, "data", "housing.db")
         self.script = extract_guard_script()
+        self._write_queries(1)          # 默认单查询；多查询用例自己覆盖
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _seed(self, taken_at=None, fetched=None, dtot=None):
+    def _write_queries(self, n):
+        """在临时仓库里写一份 queries.json，控制「今天需要几条查询才算抓完」。"""
+        os.makedirs(os.path.join(self.tmp, "scripts"), exist_ok=True)
+        qs = [{"name": f"q{i}", "params": {"a": str(i)}} for i in range(1, n + 1)]
+        with open(os.path.join(self.tmp, "scripts", "queries.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"site": "s.json", "queries": qs}, f, ensure_ascii=False)
+
+    def _seed(self, taken_at=None, fetched=None, dtot=None, query="q1"):
         if os.path.exists(self.db):
             os.remove(self.db)
         if taken_at is None:
@@ -54,9 +64,16 @@ class TestWorkflowGuard(unittest.TestCase):
         c = sqlite3.connect(self.db)
         c.executescript(
             "CREATE TABLE snapshots(id INTEGER PRIMARY KEY, taken_at TEXT,"
-            " fetched INTEGER, dtot INTEGER);")
-        c.execute("INSERT INTO snapshots(taken_at, fetched, dtot) VALUES (?,?,?)",
-                  (taken_at, fetched, dtot))
+            " query TEXT, fetched INTEGER, dtot INTEGER);")
+        c.execute("INSERT INTO snapshots(taken_at, query, fetched, dtot)"
+                  " VALUES (?,?,?,?)", (taken_at, query, fetched, dtot))
+        c.commit()
+        c.close()
+
+    def _add_snapshot(self, taken_at, query, fetched, dtot):
+        c = sqlite3.connect(self.db)
+        c.execute("INSERT INTO snapshots(taken_at, query, fetched, dtot)"
+                  " VALUES (?,?,?,?)", (taken_at, query, fetched, dtot))
         c.commit()
         c.close()
 
@@ -124,14 +141,18 @@ class TestWorkflowGuard(unittest.TestCase):
         self._seed(f"{today} 09:07:00", fetched=120, dtot=455)
         rc, out, err = self._run()
         self.assertIn("done=false", out, "抓一半也必须重抓")
-        self.assertIn("完整=False", err)
+        self.assertIn("已完成=0", err)
 
     def test_zero_dtot_must_rerun(self):
-        """dtot=0（站点没报总数）不能当成已抓完。"""
+        """dtot=0 且一行都没抓到，才算这条查询「真的空」；有行没总数仍要重抓。"""
         today = datetime.now(timezone.utc).astimezone(TZ8).strftime("%Y-%m-%d")
         self._seed(f"{today} 09:07:00", fetched=0, dtot=0)
         rc, out, _ = self._run()
-        self.assertIn("done=false", out)
+        self.assertIn("done=true", out, "0 条查询确实空了，不该整天反复重抓")
+
+        self._seed(f"{today} 09:07:00", fetched=20, dtot=0)
+        rc, out, _ = self._run()
+        self.assertIn("done=false", out, "抓到行但站点没报总数，无法确认完整性")
 
     def test_force_bypasses_guard(self):
         """手动触发带 force=true 时必须强制重抓。"""
@@ -143,10 +164,44 @@ class TestWorkflowGuard(unittest.TestCase):
 
     def test_empty_snapshots_table(self):
         c = sqlite3.connect(self.db)
-        c.executescript("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, taken_at TEXT);")
+        c.executescript(
+            "CREATE TABLE snapshots(id INTEGER PRIMARY KEY, taken_at TEXT,"
+            " query TEXT, fetched INTEGER, dtot INTEGER);")
         c.commit(); c.close()
         rc, out, _ = self._run()
         self.assertIn("done=false", out, "表存在但无数据应继续抓")
+
+    # ── 多查询（珺华赋大户型）────────────────────────
+
+    def test_multi_query_partial_must_rerun(self):
+        """只跑完一部分查询不能算今天抓完。
+
+        真实风险：主查询失败但大户型成功，旧的「看最后一条快照」逻辑
+        会判成今天已抓完，主查询当天永久缺数据。
+        """
+        today = datetime.now(timezone.utc).astimezone(TZ8).strftime("%Y-%m-%d")
+        self._write_queries(2)
+        self._seed(f"{today} 09:07:00", fetched=443, dtot=443, query="q1")
+        rc, out, err = self._run()
+        self.assertIn("done=false", out, "1/2 条查询完成，不能算抓完")
+        self.assertIn("已完成=1", err)
+
+    def test_multi_query_all_complete_skips(self):
+        today = datetime.now(timezone.utc).astimezone(TZ8).strftime("%Y-%m-%d")
+        self._write_queries(2)
+        self._seed(f"{today} 09:07:00", fetched=443, dtot=443, query="q1")
+        self._add_snapshot(f"{today} 09:08:00", "q2", 6, 6)
+        rc, out, err = self._run()
+        self.assertIn("done=true", out, "两条都完整才跳过")
+        self.assertIn("已完成=2", err)
+
+    def test_multi_query_one_incomplete_must_rerun(self):
+        today = datetime.now(timezone.utc).astimezone(TZ8).strftime("%Y-%m-%d")
+        self._write_queries(2)
+        self._seed(f"{today} 09:07:00", fetched=443, dtot=443, query="q1")
+        self._add_snapshot(f"{today} 09:08:00", "q2", 3, 6)
+        rc, out, err = self._run()
+        self.assertIn("done=false", out, "有一条没抓全就要重跑")
 
 
 def extract_push_retry_block():

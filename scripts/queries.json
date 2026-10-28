@@ -1,0 +1,35 @@
+{
+  "_note": "监控的查询集合。加一个楼盘/换面积区间只改这里，workflow 和守卫都读它。",
+  "_why_pro_query": "主查询固定 140-180㎡。珺华赋还有 191~221㎡ 的大户型不在区间内，用 txt_Pro 单独拉一次（只 6 条 1 页），不要为了几套把主查询放宽到 300（会变成 1402 条 71 页）。",
+  "site": "scripts/sites/suzhou.json",
+  "queries": [
+    {
+      "name": "园区住宅 140-180㎡",
+      "params": {
+        "ddl_qy": "RD002",
+        "ddl_houseclass": "1",
+        "rb_HF_CODE": "-1",
+        "txt_Area1": "140",
+        "txt_Area2": "180",
+        "txt_Pro": "",
+        "txt_Com": "",
+        "txt_Price1": "",
+        "txt_Price2": ""
+      }
+    },
+    {
+      "name": "保利珺华赋 大户型 180㎡以上",
+      "params": {
+        "ddl_qy": "RD002",
+        "ddl_houseclass": "1",
+        "rb_HF_CODE": "-1",
+        "txt_Area1": "180",
+        "txt_Area2": "300",
+        "txt_Pro": "君华雅筑",
+        "txt_Com": "",
+        "txt_Price1": "",
+        "txt_Price2": ""
+      }
+    }
+  ]
+}

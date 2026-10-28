@@ -352,18 +352,24 @@ def disappearance_guard(conn, site_name, query, *, pages_known, failed_pages,
         return False, f"抓到 {all_rows} 行 ≠ 站点总数 {total} 条，结果集不完整"
     if all_rows <= 0:
         return False, "本轮 0 行，无法区分「真的售罄」和「查询/解析异常」"
-    prev = conn.execute(
-        "SELECT query FROM snapshots WHERE site=? ORDER BY id DESC LIMIT 1",
-        (site_name,)).fetchone()
-    if not prev:
-        return False, "没有上一轮快照可比对查询条件，首轮不做消失判定"
-    try:
-        prev_query = json.loads(prev[0] or "{}")
-    except json.JSONDecodeError:
-        prev_query = None
-    if prev_query != dict(query):
-        return False, "查询条件与上一轮不一致，条件外房源会被误判消失"
-    return True, ""
+    # 必须按「同一查询」找上一轮，不能取全局最后一条快照：
+    # 有多条查询交替跑时（园区 140-180 与大户型是两条），全局最后一条永远是
+    # 另一条查询，条件必然不一致 —— 消失判定被永久跳过，成交一套也检测不到。
+    # 比较用「解析后的 dict」而不是字符串：--param 顺序不同不该算换条件。
+    q = dict(query)
+    rows = conn.execute(
+        "SELECT query FROM snapshots WHERE site=? ORDER BY id DESC LIMIT 500",
+        (site_name,)).fetchall()
+    if not rows:
+        return False, "没有上一轮快照可比对，首轮不做消失判定"
+    for (prev_json,) in rows:
+        try:
+            prev_query = json.loads(prev_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if prev_query == q:
+            return True, ""
+    return False, "查询条件与历史快照都不一致，条件外房源会被误判消失"
 
 
 def fetch_first_page(site, params, use_proxy):

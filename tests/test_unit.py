@@ -5,6 +5,7 @@
     python -m unittest discover -s tests -v
     python tests/test_unit.py
 """
+import importlib
 import json
 import os
 import re
@@ -674,9 +675,43 @@ class TestDisappearanceGuard(unittest.TestCase):
         self.conn.close()
 
     def _seed_prev(self, query):
+        # 必须用和生产代码同一个序列化函数（sort_keys），否则 key 顺序不同
+        # 会被判成「另一条查询」，测试就测不到真实行为。
         self.conn.execute("INSERT INTO snapshots (site,query) VALUES (?,?)",
-                          ("s", json.dumps(query, ensure_ascii=False)))
+                          ("s", wf.query_key(query)))
         self.conn.commit()
+
+    def test_multi_query_uses_same_query_history(self):
+        """多条查询交替时，必须按「同一查询」找上一轮，不能取全局最后一条。
+
+        真实事故：加了珺华赋大户型查询后，两条查询交替跑，全局最后一条快照
+        永远是「另一条查询」，条件永远不一致 —— 消失判定被永久跳过，
+        成交一套也检测不到，而日志还写着「防止误判」，看着完全正常。
+        """
+        q_main = {"ddl_qy": "RD002", "txt_Area1": "140", "txt_Area2": "180",
+                  "txt_Pro": ""}
+        q_big = {"ddl_qy": "RD002", "txt_Area1": "180", "txt_Area2": "300",
+                 "txt_Pro": "君华雅筑"}
+        self._seed_prev(q_main)
+
+        # 只有 main 的历史，现在跑 big：不能拿 main 的快照当自己的上一轮
+        ok, why = wf.disappearance_guard(
+            self.conn, "s", q_big, pages_known=True, failed_pages=[],
+            all_rows=6, total=6, max_pages=0)
+        self.assertFalse(ok, "另一条查询的快照不能当作本查询的上一轮")
+
+        # big 跑过一次之后，再跑 big 就该允许
+        self._seed_prev(q_big)
+        ok, why = wf.disappearance_guard(
+            self.conn, "s", q_big, pages_known=True, failed_pages=[],
+            all_rows=6, total=6, max_pages=0)
+        self.assertTrue(ok, f"同一查询有历史时应允许消失判定: {why}")
+
+        # 关键：此时全局最后一条是 big，main 仍应找到自己的历史
+        ok, why = wf.disappearance_guard(
+            self.conn, "s", q_main, pages_known=True, failed_pages=[],
+            all_rows=438, total=438, max_pages=0)
+        self.assertTrue(ok, f"main 不能被 big 的快照挤掉: {why}")
 
     def test_blocks_max_pages_truncation(self):
         self._seed_prev({"a": "1"})
@@ -923,6 +958,57 @@ class TestRealDataIntegrity(unittest.TestCase):
                          "趋势里不能有 alive<=0 的点（假暴跌）")
         key = [x["date"] + " " + x["time"] for x in t]
         self.assertEqual(key, sorted(key), "趋势点必须按时间升序")
+
+
+class TestQueriesConfig(unittest.TestCase):
+    """queries.json 与 run_queries.py：多查询编排的正确性。"""
+
+    def setUp(self):
+        self.cfg_path = os.path.join(ROOT, "scripts", "queries.json")
+        with open(self.cfg_path, encoding="utf-8") as f:
+            self.cfg = json.load(f)
+
+    def test_has_main_query(self):
+        mains = [q for q in self.cfg["queries"]
+                 if q["params"].get("txt_Area1") == "140"
+                 and q["params"].get("txt_Area2") == "180"]
+        self.assertTrue(mains, "必须保留园区 140-180 主查询")
+
+    def test_has_big_unit_query_for_junhua(self):
+        """珺华赋 190+ 大户型必须单独成一条查询（锁盘 + 180 起）。
+
+        为什么不放宽主查询：140-300 全量是 1402 条 71 页，为了 6 套房
+        多抓 65 页；而且会把别的楼盘 190+ 单位也混进来，改变统计口径。
+        """
+        hits = [q for q in self.cfg["queries"]
+                if q["params"].get("txt_Pro") == "君华雅筑"
+                and float(q["params"].get("txt_Area1", 0)) >= 180]
+        self.assertTrue(hits, "缺少珺华赋大户型查询")
+
+    def test_every_query_has_site_and_params(self):
+        self.assertTrue(self.cfg.get("site"), "必须声明 site")
+        for q in self.cfg["queries"]:
+            self.assertTrue(q.get("name"), "每条查询要有可读名字（写日志用）")
+            self.assertIsInstance(q.get("params"), dict)
+            self.assertTrue(q["params"], "params 不能为空")
+
+    def test_query_keys_are_distinct(self):
+        """两条查询的 query_key 必须不同，否则消失判定会互相串门。"""
+        keys = [wf.query_key(q["params"]) for q in self.cfg["queries"]]
+        self.assertEqual(len(keys), len(set(keys)), "存在重复的查询条件")
+
+    def test_build_args_passes_every_param(self):
+        rq = importlib.import_module("run_queries")
+        args = rq.build_args("py", "site.json", "db.sqlite",
+                             {"a": "1", "b": "2"}, 1.5, 0)
+        self.assertIn("a=1", args)
+        self.assertIn("b=2", args)
+        self.assertEqual(args[args.index("--interval") + 1], "1.5")
+
+    def test_build_args_includes_max_pages_when_set(self):
+        rq = importlib.import_module("run_queries")
+        args = rq.build_args("py", "s", "d", {}, 1.0, 3)
+        self.assertEqual(args[args.index("--max-pages") + 1], "3")
 
 
 if __name__ == "__main__":
