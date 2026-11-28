@@ -57,16 +57,6 @@ jobs:
           echo "使用浏览器: $CHROME_PATH"
           python tests/test_e2e.py
 
-  # ── 部署（依赖 test 通过）────────────────────────────
-  deploy:
-    needs: test
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - uses: actions/checkout@v4
-
       - name: 校验产物（避免部署空白页）
         run: |
           test -f web/index.html || { echo "web/index.html 缺失"; exit 1; }
@@ -79,5 +69,13 @@ jobs:
         with:
           path: web
 
+  # ── 部署（依赖 test 通过）────────────────────────────
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - id: deployment
         uses: actions/deploy-pages@v4
